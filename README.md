@@ -1,4 +1,8 @@
+<img src="images/interaction_lab_logo.png" alt="Interaction Laboratory" width="150" align="right">
+
 # 画像認識 講義用サンプルコード
+
+**立命館大学 情報理工学部「実世界情報処理」教材**
 
 講義で動かして見せた Python + OpenCV のサンプルプログラムです。
 自分のパソコンで動かして、パラメータを変えたり処理を書き換えたりしてみてください。
@@ -243,6 +247,7 @@ python flann.py --method magsac        # ロバスト推定法を変える
 
 このリポジトリのプログラムは [MIT License](LICENSE) で公開しています。
 ただし、`models/` の学習済みモデルはそれぞれのライセンスに従います（下記）。
+また、研究室のロゴ（`images/interaction_lab_logo.png`）は MIT License の対象外です。
 
 ## 同梱している学習済みモデルについて
 
