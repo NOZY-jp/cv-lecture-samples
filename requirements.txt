@@ -1,0 +1,10 @@
+# 画像認識講義 サンプルコード用
+#
+# opencv-contrib-python は opencv-python の上位互換で、OpenCV 5 で本体から外れた
+# 旧来のアルゴリズム（Haar-like 顔検出、KAZE/AKAZE/BRISK など）も含みます。
+# OpenCV 4.8 以降なら 4.x / 5.x のどちらでも動きます。
+#
+# 注意: opencv-python / opencv-contrib-python / opencv-python-headless は
+#       同時にインストールしないでください（どれか1つだけ）。
+numpy
+opencv-contrib-python>=4.8
