@@ -5,3 +5,9 @@ venv/
 .DS_Store
 Thumbs.db
 .ipynb_checkpoints/
+
+# download_models.py でダウンロードするモデル
+models/person_detection_mediapipe_2023mar.onnx
+models/pose_estimation_mediapipe_2023mar.onnx
+models/*.task
+models/*.part

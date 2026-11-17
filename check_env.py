@@ -138,6 +138,28 @@ result(hasattr(cv2, "FaceDetectorYN"), "YuNet (FaceDetectorYN)",
 result(os.path.exists(yunet), "YuNet モデル (models/face_detection_yunet_2023mar.onnx)",
        "models フォルダごとダウンロードし直してください")
 
+print("--- 人体の骨格推定 (capture.py の K キー) ---")
+pose_files = [os.path.join(HERE, "models", f) for f in
+              ("person_detection_mediapipe_2023mar.onnx", "pose_estimation_mediapipe_2023mar.onnx")]
+result(all(os.path.exists(f) for f in pose_files), "MediaPipe Pose モデル (models/)",
+       "python download_models.py でダウンロードしてください（骨格推定以外はこのままでも使えます）",
+       required=False)
+
+print("--- MediaPipe（任意: mediapipe_demo.py）---")
+try:
+    import importlib.util as _u
+    has_mp = _u.find_spec("mediapipe") is not None
+    mp_ver = metadata.version("mediapipe") if has_mp else ""
+except Exception:
+    has_mp, mp_ver = False, ""
+result(has_mp, "mediapipe %s" % mp_ver if has_mp else "mediapipe",
+       "pip install -r requirements-mediapipe.txt（Intel 製 CPU の Mac には非対応）", required=False)
+if has_mp:
+    tasks = [os.path.join(HERE, "models", f) for f in
+             ("face_landmarker.task", "pose_landmarker_full.task", "hand_landmarker.task")]
+    result(all(os.path.exists(f) for f in tasks), "MediaPipe のモデル (models/*.task)",
+           "python download_models.py でダウンロードしてください", required=False)
+
 print("--- カメラ ---")
 cam = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 cap = cv2.VideoCapture(cam)

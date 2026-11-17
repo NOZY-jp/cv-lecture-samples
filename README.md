@@ -12,8 +12,11 @@
 | `capture.py` | Webカメラの画像を1フレームずつ取り込み、キー操作で選んだ画像処理（フィルタ・エッジ・二値化・ラベリング・オプティカルフロー・顔検出など）を行って表示します |
 | `flann.py` | SIFT などの局所特徴の対応付けから RANSAC で射影変換行列を推定し、カメラ画像中の平面物体（本の表紙など）を検出します |
 | `setup.sh` / `setup.bat` | セットアップ用（仮想環境の作成とモジュールのインストール） |
+| `mediapipe_demo.py` | MediaPipe による Face Mesh・顔の向き・表情・骨格・手の推定（mediapipe が必要・任意） |
+| `pose_estimation.py` | 人体の骨格推定の処理（`capture.py` の `K` キーから使われる。単体でも実行可） |
 | `check_env.py` | 環境チェック用（モジュールが入っているか、各アルゴリズムやカメラが使えるか） |
-| `models/` | 顔検出用の学習済みモデル（Haar-like カスケード、YuNet） |
+| `download_models.py` | 骨格推定用の学習済みモデルのダウンロード（セットアップ時に自動実行） |
+| `models/` | 学習済みモデル（顔検出の Haar-like カスケード・YuNet、骨格推定の MediaPipe Pose） |
 
 ## 必要なもの
 
@@ -57,7 +60,8 @@ sh setup.sh
 setup.bat
 ```
 
-`numpy` と `opencv-contrib-python` がインストールされ、最後に環境チェック（`check_env.py`）の結果が表示されます。
+`numpy` と `opencv-contrib-python`、可能なら `mediapipe`（任意）がインストールされ、学習済みモデル（合計約 40MB）がダウンロードされたあと、最後に環境チェック（`check_env.py`）の結果が表示されます。
+`mediapipe` は Intel 製 CPU の Mac には対応していないため、インストールできなくてもそのまま進みます（`mediapipe_demo.py` 以外は使えます）。
 すべて `[OK]` になれば準備完了です。`[--]` は参考情報なので気にしなくて構いません。
 `[NG]` があれば、表示される指示に従ってください。
 
@@ -138,6 +142,7 @@ python capture.py movie.mp4   # カメラの代わりに動画ファイルを使
 | `b` | 二値化（大津の方法） | `d` | DoG フィルタ |
 | `:` | SIFT 特徴点 | `e` | ヒストグラム平坦化 |
 | `u` | **自作の処理**（後述） | `E` | 適応的ヒストグラム平坦化（CLAHE） |
+| | | `K` | 人体の骨格推定（MediaPipe Pose） |
 
 前処理（ぼかし）:
 
@@ -150,7 +155,7 @@ python capture.py movie.mp4   # カメラの代わりに動画ファイルを使
 | `↓` / `-` | ぼかしを弱く |
 | `ESC` | ぼかしをリセット |
 
-その他: `p` 顔検出（`F`）中に横顔検出の ON/OFF、`?` ヘルプ表示の ON/OFF、`q` 終了
+その他: `p` 顔検出（`F`）中に横顔検出の ON/OFF、`k` 骨格推定（`K`）中に平滑化の ON/OFF、`?` ヘルプ表示の ON/OFF、`q` 終了
 
 起動するとキー操作の一覧がウィンドウに重ねて表示されます（背景は暗くなります）。`?` キーで消したり表示したりできます。選択中の処理は黄色で表示されます。
 OpenCV 5 では日本語、OpenCV 4 では英語で表示されます（OpenCV 4 は日本語の文字を描けないため）。起動時に表示したくない場合は、`capture.py` 先頭の `SHOW_HELP_AT_START` を `False` にしてください。
@@ -161,6 +166,30 @@ OpenCV 5 では日本語、OpenCV 4 では英語で表示されます（OpenCV 4
 - `Y`: **YuNet**（小さな CNN による顔検出器, OpenCV 4.8 以降で標準搭載）。顔の枠に加えて、目・鼻・口の両端の5点と信頼度を表示します。
 
 顔を傾けたり、横を向いたり、手で一部を隠したりして、2つの手法の違いを確かめてみてください。
+
+#### 人体の骨格推定
+
+`K` キーで、カメラに映った人の骨格（関節 33 点）を推定して表示します。左半身はオレンジ、右半身は水色で描かれます。
+OpenCV 5 には骨格推定の機能そのものは含まれていないため、[OpenCV Zoo](https://github.com/opencv/opencv_zoo) で公開されている
+MediaPipe（BlazePose）のモデルを OpenCV の DNN モジュールで動かしています。
+処理の中身は `pose_estimation.py` にまとめてあり、MediaPipe Pose（ライブラリ）が内部で行っている処理と同じ構成です。
+
+1. **切り出し位置を決める**: 最初のフレームは**人物検出**で人を探し、「腰の中心」と「全身の大きさと向きを表す点」を求める。
+   2フレーム目以降は、前のフレームの結果から決める（**追跡**）ので、人物検出を毎回行わずに済む
+2. **骨格推定**: 人物を囲む正方形を、体がまっすぐ立つ向きに回転させて切り出し、関節の位置を推定する。
+   モデルは関節の座標と、関節ごとの「ありそうな場所」を表す画像（**ヒートマップ**）の両方を出力するので、
+   ヒートマップを使って座標を細かく補正する（特に顔の点の位置が正確になります）
+3. **平滑化**: 推定結果は毎フレーム少しずつ揺れるので、**One Euro Filter** で時間方向になめらかにする。
+   ゆっくり動くときは強くならして揺れを消し、速く動くときは弱くならして遅れを防ぐフィルタです
+4. 平滑化した結果から、次のフレームの切り出し位置を決める（1 へ戻る）
+
+実行中に `k` キーを押すと平滑化を OFF にできます。ON と OFF で骨格の揺れ方を比べてみてください。
+
+カメラから少し離れて、**少なくとも肩から腰まで（できれば全身）が映るように**してください。顔のアップでは検出できません。
+また、1人だけを対象にしています。
+
+骨格推定だけを試したいときは、`python pose_estimation.py` で単体でも動かせます（`s` で平滑化の ON/OFF、`q` で終了）。
+モデルはセットアップ時に自動でダウンロードされます。失敗した場合は `python download_models.py` を実行してください。
 
 #### 自分で処理を書いてみる
 
@@ -187,9 +216,24 @@ python flann.py --method magsac        # ロバスト推定法を変える
 
 1. 起動するとカメラ映像が表示されます。本の表紙やお菓子の箱など、**模様の多い平らな物体**を映してスペースキーを押します。
 2. 静止画上でマウスをドラッグして物体を囲み、Enter で決定します（`c` でやり直し）。
-3. 物体を動かしたり傾けたりすると、検出された位置が水色の四角で表示されます。緑の線は RANSAC でインライアと判定された対応点です。
+3. 物体を動かしたり傾けたりすると、検出された位置が水色の四角で表示されます。
 
-キー操作: `t` テンプレートを選び直す、`ESC` / `q` 終了
+対応点を結ぶ線の色の意味:
+
+| 色 | 意味 |
+| --- | --- |
+| 緑 〜 黄 〜 オレンジ | **インライア**: RANSAC で推定した射影変換に合う対応。**再投影誤差**が小さいほど緑、閾値に近いほどオレンジ |
+| 赤 | **アウトライア**: ratio test は通ったが、再投影誤差が閾値を超え、外れ値として除外された対応 |
+| 黄（すべての線） | 対応点が少なく射影変換を推定しなかったときの、ratio test を通った対応 |
+
+**再投影誤差**とは、テンプレート側の特徴点を推定した射影変換で写した位置と、実際に対応したカメラ画像側の特徴点との距離です。
+左上にはインライアの再投影誤差の平均と最大が表示されます。インライアの数が多く、誤差が小さいほど、射影変換がよく当てはまっています。
+（誤差は処理のために縮小した画像上の画素数です）
+
+`o` キーでアウトライア（赤）の表示を消したり戻したりできます。`--method magsac`・`--ratio`・`--reproj` を変えて、
+インライアの数や誤差の分布がどう変わるか比べてみてください。
+
+キー操作: `o` アウトライアの表示 ON/OFF、`t` テンプレートを選び直す、`ESC` / `q` 終了
 
 オプション:
 
@@ -200,6 +244,7 @@ python flann.py --method magsac        # ロバスト推定法を変える
 | `--feature 名前` | 局所特徴量の種類（下表、既定は `sift`） |
 | `--method ransac` / `magsac` | 射影変換のロバスト推定法（既定は `ransac`） |
 | `--ratio 0.7` | Lowe の ratio test の閾値（小さいほど厳しい） |
+| `--reproj 5` | インライアとみなす再投影誤差の閾値 [画素]（小さいほど厳しい） |
 | `--scale 0.5` | 処理時にカメラ画像を縮小する倍率 |
 
 局所特徴量:
@@ -220,6 +265,35 @@ python flann.py --method magsac        # ロバスト推定法を変える
 
 - `ransac`: 古典的な RANSAC。ランダムに選んだ4組の対応点から射影変換を求め、インライア数が最大のものを選びます。
 - `magsac`: MAGSAC++。インライアかどうかを閾値で二分せず、残差に応じた重みで評価する、比較的新しい手法です（OpenCV 4.5 以降）。
+
+### mediapipe_demo.py — MediaPipe による顔・表情・骨格・手の推定（任意）
+
+```
+python mediapipe_demo.py          # カメラ 0
+python mediapipe_demo.py 1        # カメラ 1
+```
+
+Google の [MediaPipe](https://ai.google.dev/edge/mediapipe/solutions/guide) ライブラリを使って、次の推定を行います。
+それぞれキーで ON/OFF でき、同時に使うこともできます。
+
+| キー | 内容 |
+| --- | --- |
+| `f` | **Face Mesh**: 顔の 478 点のメッシュと、顔の向き（鼻先から顔の右＝赤・上＝緑・正面＝青の矢印、yaw/pitch/roll の角度） |
+| `b` | **表情（Blendshapes）**: まばたき・口の開き・眉の上げ下げなど 52 種類の表情の強さのうち、大きいものを棒グラフで表示 |
+| `p` | **骨格（Pose）**: 全身 33 点。capture.py の `K` キーと同じ描き方なので比べてみてください |
+| `h` | **手（Hand）**: 両手それぞれ 21 点と左右の判定 |
+| `m` | 左右反転（鏡のように表示。最初は ON） |
+| `q` / `ESC` | 終了 |
+
+capture.py の `K` キー（`pose_estimation.py`）は、MediaPipe の骨格推定のモデルを OpenCV で動かして**中身を見せる**ためのもの、
+こちらは MediaPipe ライブラリ**そのもの**を使うものです。
+
+mediapipe をあとから入れる場合は、仮想環境を有効にしてから次を実行してください（Intel 製 CPU の Mac には対応していません）。
+
+```
+pip install -r requirements-mediapipe.txt
+python download_models.py
+```
 
 ## うまく動かないとき
 
@@ -255,5 +329,9 @@ python flann.py --method magsac        # ロバスト推定法を変える
 | --- | --- | --- |
 | `models/haarcascades/*.xml` | [OpenCV](https://github.com/opencv/opencv/tree/4.x/data/haarcascades) | Intel License Agreement（各ファイル先頭に記載） |
 | `models/face_detection_yunet_2023mar.onnx` | [OpenCV Zoo / YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) | MIT License（`models/LICENSE_YuNet`） |
+| `models/person_detection_mediapipe_2023mar.onnx`<br>`models/pose_estimation_mediapipe_2023mar.onnx`<br>（`download_models.py` でダウンロード） | [OpenCV Zoo / MediaPipe Pose](https://github.com/opencv/opencv_zoo/tree/main/models/pose_estimation_mediapipe) | Apache License 2.0（`models/LICENSE_MediaPipe_Pose`） |
+| `models/face_landmarker.task`<br>`models/pose_landmarker_full.task`<br>`models/hand_landmarker.task`<br>（`download_models.py` でダウンロード） | [MediaPipe](https://ai.google.dev/edge/mediapipe/solutions/guide) | 各モデルのモデルカードを参照 |
 
 Haar-like カスケードのファイルは OpenCV 4.x の pip 版には同梱されていましたが、OpenCV 5 の pip 版には含まれなくなったため、このリポジトリに同梱しています。
+`pose_estimation.py` の骨格推定の前処理・後処理は OpenCV Zoo の `mp_persondet.py` / `mp_pose.py`（Apache License 2.0）を参考に書き直したもので、
+ヒートマップによる補正と平滑化は MediaPipe（Apache License 2.0）の `refine_landmarks_from_heatmap_calculator.cc` と `pose_landmark_filtering.pbtxt` に合わせています。

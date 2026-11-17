@@ -1,0 +1,7 @@
+# mediapipe_demo.py 用（任意）
+#
+# Google の MediaPipe ライブラリ。Face Mesh・表情・骨格・手の推定に使います。
+# 対応環境: Windows (x64/ARM64), Linux (x86_64/aarch64), macOS (Apple シリコン)。
+# Intel 製 CPU の Mac には対応していないため、インストールできなくても
+# ほかのプログラムはそのまま使えます。
+mediapipe>=1.2

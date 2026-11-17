@@ -56,6 +56,18 @@ echo "必要なモジュールをインストールしています（数分か�
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
 
+# --- mediapipe（任意。mediapipe_demo.py 用。入らない環境でも続行）---
+echo ""
+echo "mediapipe（任意）をインストールしています..."
+if ! .venv/bin/python -m pip install -r requirements-mediapipe.txt; then
+    echo "（mediapipe はこの環境にはインストールできませんでした。mediapipe_demo.py 以外は使えます）"
+fi
+
+# --- 学習済みモデルのダウンロード（失敗しても続行）---
+echo ""
+echo "学習済みモデルをダウンロードしています..."
+.venv/bin/python download_models.py || true
+
 # --- 環境チェック ---
 echo ""
 .venv/bin/python check_env.py || true
@@ -72,5 +84,6 @@ cat <<'EOF'
 
     python capture.py
     python flann.py
+    python mediapipe_demo.py   （mediapipe が入った場合）
 ----------------------------------------------------------------------
 EOF

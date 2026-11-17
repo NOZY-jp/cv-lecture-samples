@@ -60,6 +60,17 @@ if errorlevel 1 goto :fail
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 if errorlevel 1 goto :fail
 
+rem --- mediapipe（任意。mediapipe_demo.py 用。入らない環境でも続行）---
+echo.
+echo mediapipe（任意）をインストールしています...
+.venv\Scripts\python.exe -m pip install -r requirements-mediapipe.txt
+if errorlevel 1 echo （mediapipe はこの環境にはインストールできませんでした。mediapipe_demo.py 以外は使えます）
+
+rem --- 学習済みモデルのダウンロード（失敗しても続行）---
+echo.
+echo 学習済みモデルをダウンロードしています...
+.venv\Scripts\python.exe download_models.py
+
 rem --- 環境チェック ---
 echo.
 .venv\Scripts\python.exe check_env.py
@@ -75,6 +86,7 @@ echo プロンプトの先頭に (.venv) と表示されたら、次のように
 echo.
 echo     python capture.py
 echo     python flann.py
+echo     python mediapipe_demo.py   （mediapipe が入った場合）
 echo ----------------------------------------------------------------------
 pause
 exit /b 0

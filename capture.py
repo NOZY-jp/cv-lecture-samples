@@ -68,6 +68,7 @@ class State:
         # 顔検出器は必要になったときに読み込む（load_haar / load_yunet）
         self.haar = None          # Haar-like 特徴カスケード（古典的手法）
         self.yunet = None         # YuNet（CNN による顔検出）
+        self.pose = None          # MediaPipe Pose（人体の骨格推定）
         self.profile_face = True
 
         # Lucas-Kanade 追跡用
@@ -409,6 +410,36 @@ def proc_hist_eq_clahe(img, st):
     return st.clahe.apply(gray)
 
 
+# ----------------------------------------------------------------------
+# 人体の骨格推定（中身は pose_estimation.py を参照）
+# ----------------------------------------------------------------------
+def load_pose(st):
+    """骨格推定器を読み込む。使えなければ False を返す"""
+    if st.pose is None:
+        import pose_estimation
+        missing = [p for p in (pose_estimation.PERSON_DET_MODEL, pose_estimation.POSE_MODEL)
+                   if not os.path.exists(p)]
+        if missing:
+            print("骨格推定のモデルがありません: %s" % ", ".join(os.path.basename(p) for p in missing))
+            print("python download_models.py でダウンロードしてください。")
+            st.pose = False
+        else:
+            st.pose = pose_estimation.PoseEstimator()
+    return st.pose is not False
+
+
+def proc_pose(img, st):
+    # 人体の骨格推定（33 点）。k キーで時間方向の平滑化を ON/OFF
+    if not load_pose(st):
+        return show_unavailable(img, "Pose model not found: python download_models.py")
+    import pose_estimation
+    result = img.copy()
+    res = st.pose.process(img)
+    if res is not None:
+        pose_estimation.draw_pose(result, *res)
+    return result
+
+
 def proc_custom(img, st):
     """
     ★ ここに自分の処理を書いてみよう（キー 'u' で実行）★
@@ -438,6 +469,7 @@ PROCS = {
     't': ("lktracking",    proc_lktracking,    "特徴点追跡（Lucas-Kanade）"),
     'F': ("facedetect",    proc_facedetect,    "顔検出（Haar-like 特徴・Viola-Jones 法）"),
     'Y': ("yunet",         proc_yunet,         "顔検出（YuNet・CNN）"),
+    'K': ("pose",          proc_pose,          "人体の骨格推定（MediaPipe Pose）"),
     'U': ("bodydetect",    proc_bodydetect,    "上半身検出（Haar-like）"),
     'd': ("dog",           proc_dog,           "DoG フィルタ"),
     'e': ("hist_eq",       proc_hist_eq,       "ヒストグラム平坦化"),
@@ -463,6 +495,7 @@ def print_help():
     print("  ↑ / + : ぼかしを強く        ↓ / - : ぼかしを弱く")
     print("  ESC   : ぼかしをリセット")
     print("  p     : 顔検出中に横顔検出の ON/OFF")
+    print("  k     : 骨格推定中に平滑化の ON/OFF")
     print("  n     : NDI 送信の ON/OFF（ndi-python が必要・任意）")
     print("  ?     : ヘルプ表示の ON/OFF（ウィンドウ）")
     print("  q     : 終了")
@@ -484,6 +517,7 @@ HELP_EN = {   # OpenCV 4 用の英語の説明（ない処理は処理名をそ�
     "lktracking": "Feature tracking (Lucas-Kanade)",
     "facedetect": "Face detection (Haar-like, Viola-Jones)",
     "yunet": "Face detection (YuNet, CNN)", "bodydetect": "Upper body detection (Haar-like)",
+    "pose": "Human pose estimation (MediaPipe Pose)",
     "dog": "DoG filter", "hist_eq": "Histogram equalization",
     "hist_eq_CLAHE": "Adaptive histogram equalization (CLAHE)",
     "custom": "Your own processing (edit proc_custom)",
@@ -542,6 +576,7 @@ def help_columns(st, ja):
              "median": "k=%d" % st.median_scale,
              "bilateral": "d=%d" % st.bilateral_scale}.get(st.blur_proc, "")
     profile = "ON" if st.profile_face else "OFF"
+    smooth = "OFF" if (st.pose and not st.pose.smoothing) else "ON"
     if ja:
         col2 += [("↑ / +", "ぼかしを強く", COLOR_ITEM),
                  ("↓ / -", "ぼかしを弱く", COLOR_ITEM),
@@ -550,6 +585,7 @@ def help_columns(st, ja):
                  ("", "", COLOR_ITEM),
                  ("", "その他", COLOR_HEAD),
                  ("p", "横顔検出 %s（顔検出 F の実行中）" % profile, COLOR_ITEM),
+                 ("k", "骨格の平滑化 %s（骨格推定 K の実行中）" % smooth, COLOR_ITEM),
                  ("n", "NDI 送信 ON/OFF（任意機能）", COLOR_ITEM),
                  ("?", "このヘルプを閉じる / 開く", COLOR_ITEM),
                  ("q", "終了", COLOR_ITEM)]
@@ -561,6 +597,7 @@ def help_columns(st, ja):
                  ("", "", COLOR_ITEM),
                  ("", "Others", COLOR_HEAD),
                  ("p", "profile face %s (during F)" % profile, COLOR_ITEM),
+                 ("k", "pose smoothing %s (during K)" % smooth, COLOR_ITEM),
                  ("n", "NDI output ON/OFF (optional)", COLOR_ITEM),
                  ("?", "close / open this help", COLOR_ITEM),
                  ("q", "quit", COLOR_ITEM)]
@@ -621,7 +658,7 @@ def draw_help(img, st, drawer, cache):
     """画像を暗くしてヘルプを重ねる（文字の画像は内容が変わったときだけ作り直す）"""
     H, W = img.shape[:2]
     key = (W, H, st.proc, st.blur_proc, st.gaussian_scale, st.median_scale,
-           st.bilateral_scale, st.profile_face)
+           st.bilateral_scale, st.profile_face, bool(st.pose and st.pose.smoothing))
     if cache.get("key") != key:
         cache["key"] = key
         cache["layer"] = render_help_layer(W, H, st, drawer)
@@ -771,9 +808,15 @@ def main():
             st.proc = PROCS[key][0]
             if st.proc == "lktracking":
                 st.lk_reset = True
+            if st.proc == "pose" and st.pose:
+                st.pose.reset()
             if st.proc in ("dog", "hist_eq", "hist_eq_CLAHE"):
                 st.blur_proc = "gaussian"
             print("proc:", st.proc)
+        elif key == 'k' and st.proc == "pose" and st.pose:
+            st.pose.smoothing = not st.pose.smoothing
+            st.pose.reset()
+            print("pose smoothing:", "ON" if st.pose.smoothing else "OFF")
         elif key == 'p' and st.proc == "facedetect":
             st.profile_face = not st.profile_face
             print("profile face mode" if st.profile_face else "frontal face mode")

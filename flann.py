@@ -13,10 +13,18 @@ RANSAC で射影変換行列（ホモグラフィ）を推定して、カメラ�
     python flann.py --camera 1               # カメラ番号を指定
     python flann.py --feature akaze          # 特徴量を変更 (sift/surf/kaze/akaze/brisk/orb)
     python flann.py --method magsac          # ロバスト推定法を変更 (ransac/magsac)
+    python flann.py --reproj 3               # インライアとみなす再投影誤差の閾値 [画素]
 
 キー操作（画像ウィンドウを選択した状態で）:
+    o   : アウトライア（RANSAC で外れ値とされた対応）の表示 ON/OFF
     t   : カメラ画像からテンプレートを選び直す
     ESC / q : 終了
+
+対応点の線の色:
+    緑〜オレンジ: インライア。再投影誤差（テンプレート側の点を推定した射影変換で写した位置と、
+                  実際に対応したカメラ画像側の点との距離）が小さいほど緑、閾値に近いほどオレンジ
+    赤: アウトライア（ratio test は通ったが、誤差が閾値を超え外れ値とされた対応）
+    黄: 対応が少なく射影変換を推定しなかったときの、ratio test を通った対応
 """
 
 import argparse
@@ -152,6 +160,87 @@ def ratio_test(knn_matches, ratio):
     return good
 
 
+COLOR_OUTLIER = (0, 0, 255)      # 赤
+COLOR_CANDIDATE = (0, 255, 255)  # 黄
+
+
+def reprojection_errors(H, src_pts, dst_pts):
+    """各対応の再投影誤差 [画素]:
+    テンプレート側の点を射影変換 H で写した位置と、カメラ画像側の対応点との距離"""
+    projected = cv2.perspectiveTransform(src_pts, H)
+    return np.linalg.norm(projected - dst_pts, axis=2).ravel()
+
+
+def error_color(err, threshold):
+    """再投影誤差を色にする: 0 = 緑 → 閾値の半分 = 黄 → 閾値 = オレンジ"""
+    t = min(max(err / threshold, 0.0), 1.0)
+    hue = int(round(60 - 48 * t))           # OpenCV の色相（0〜179）: 60=緑, 30=黄, 12=オレンジ
+    bgr = cv2.cvtColor(np.uint8([[[hue, 255, 255]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    return tuple(int(c) for c in bgr)
+
+
+def side_by_side(img1, img2):
+    """2 枚の画像を左右に並べる。(並べた画像, 右の画像の左端の x 座標) を返す"""
+    a = cv2.cvtColor(img1, cv2.COLOR_GRAY2BGR) if img1.ndim == 2 else img1
+    b = cv2.cvtColor(img2, cv2.COLOR_GRAY2BGR) if img2.ndim == 2 else img2
+    canvas = np.zeros((max(a.shape[0], b.shape[0]), a.shape[1] + b.shape[1], 3), np.uint8)
+    canvas[:a.shape[0], :a.shape[1]] = a
+    canvas[:b.shape[0], a.shape[1]:] = b
+    return canvas, a.shape[1]
+
+
+def draw_correspondences(img1, kp1, img2, kp2, good, inlier_mask, errors, threshold,
+                         show_outliers=True, zoom=1.0):
+    """対応点を線で結んだ画像を作る（zoom 倍に拡大してから描くので線がぼやけない）。
+    inlier_mask, errors: good と同じ長さ（射影変換を推定しなかったときは None）"""
+    canvas, offset = side_by_side(img1, img2)
+    canvas = cv2.resize(canvas, None, fx=zoom, fy=zoom)
+
+    def draw(m, color):
+        p = kp1[m.queryIdx].pt
+        q = kp2[m.trainIdx].pt
+        p = (int(round(p[0] * zoom)), int(round(p[1] * zoom)))
+        q = (int(round((q[0] + offset) * zoom)), int(round(q[1] * zoom)))
+        cv2.line(canvas, p, q, color, 1, cv2.LINE_AA)
+        cv2.circle(canvas, p, 3, color, 1, cv2.LINE_AA)
+        cv2.circle(canvas, q, 3, color, 1, cv2.LINE_AA)
+
+    if inlier_mask is None:
+        # 射影変換を推定していない → ratio test を通った対応をすべて黄色で
+        for m in good:
+            draw(m, COLOR_CANDIDATE)
+        return canvas
+    if show_outliers:                                   # アウトライアを先に赤で描く
+        for m, inl in zip(good, inlier_mask):
+            if not inl:
+                draw(m, COLOR_OUTLIER)
+    # インライアは誤差の小さい順に描く（誤差の大きい線が上に来て目立つ）
+    inliers = [i for i, inl in enumerate(inlier_mask) if inl]
+    for i in sorted(inliers, key=lambda i: errors[i]):
+        draw(good[i], error_color(errors[i], threshold))
+    return canvas
+
+
+def draw_error_legend(img, threshold, x, y, width=200):
+    """再投影誤差の色の凡例（カラーバー）と、アウトライアの色を描く"""
+    for i in range(width):
+        cv2.line(img, (x + i, y), (x + i, y + 12), error_color(threshold * i / (width - 1), threshold), 1)
+    cv2.rectangle(img, (x, y), (x + width, y + 12), (0, 0, 0), 1)
+    put_label(img, "0", (x - 4, y + 32), (255, 255, 255), 0.5)
+    put_label(img, "%g px" % threshold, (x + width - 30, y + 32), (255, 255, 255), 0.5)
+    put_label(img, "inlier error", (x + width // 2 - 45, y - 8), (255, 255, 255), 0.5)
+    cv2.rectangle(img, (x + width + 20, y), (x + width + 40, y + 12), COLOR_OUTLIER, -1)
+    put_label(img, "outlier", (x + width + 46, y + 11), COLOR_OUTLIER, 0.5)
+    cv2.rectangle(img, (x + width + 130, y), (x + width + 150, y + 12), COLOR_CANDIDATE, -1)
+    put_label(img, "candidate (no homography)", (x + width + 156, y + 11), COLOR_CANDIDATE, 0.5)
+
+
+def put_label(img, text, org, color, scale=0.7):
+    """黒いふち付きの文字（どんな背景でも読めるように）"""
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
+
+
 def main():
     parser = argparse.ArgumentParser(description="特徴点マッチング＋RANSACによる平面物体検出")
     parser.add_argument("--camera", "-c", type=int, default=0, help="カメラ番号 (default: 0)")
@@ -162,6 +251,8 @@ def main():
     parser.add_argument("--method", "-m", default="ransac", choices=list(METHODS),
                         help="射影変換のロバスト推定法 (default: ransac)")
     parser.add_argument("--ratio", type=float, default=0.7, help="ratio test の閾値 (default: 0.7)")
+    parser.add_argument("--reproj", type=float, default=5.0,
+                        help="インライアとみなす再投影誤差の閾値 [縮小後の画像の画素] (default: 5)")
     parser.add_argument("--scale", type=float, default=0.5,
                         help="処理のためにカメラ画像を縮小する倍率 (default: 0.5)")
     # 互換のため、オプションなしの数字もカメラ番号として受け付ける（python flann.py 1）
@@ -194,7 +285,9 @@ def main():
         img1 = select_template_from_camera(cap, args.scale)
     kp1, des1 = prepare(img1)
 
-    print("t: テンプレートを選び直す   ESC/q: 終了")
+    print("o: アウトライアの表示 ON/OFF   t: テンプレートを選び直す   ESC/q: 終了")
+    print("線の色  緑〜オレンジ: インライア（再投影誤差が小さいほど緑）  赤: アウトライア  黄: RANSAC 前の候補")
+    show_outliers = True
 
     while True:
         ret, img2 = cap.read()
@@ -205,7 +298,7 @@ def main():
         kp2, des2 = detector.detectAndCompute(img2, None)
 
         good = []
-        matchesMask = None
+        matchesMask, errors = None, None
         if des1 is not None and des2 is not None and len(kp2) >= 2:
             # 各テンプレート特徴点について、カメラ画像中の近い候補を2つ探す
             matches = matcher.knnMatch(des1, des2, k=2)
@@ -215,10 +308,11 @@ def main():
             src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
             dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
-            # RANSAC 等で射影変換行列を推定（再投影誤差 5 画素以内をインライアとする）
-            M, mask = cv2.findHomography(src_pts, dst_pts, method, 5.0)
+            # RANSAC 等で射影変換行列を推定（再投影誤差が閾値以内の対応をインライアとする）
+            M, mask = cv2.findHomography(src_pts, dst_pts, method, args.reproj)
             if M is not None:
                 matchesMask = mask.ravel().tolist()
+                errors = reprojection_errors(M, src_pts, dst_pts)
                 if sum(matchesMask) >= 4:
                     # テンプレートの四隅を射影変換してカメラ画像上に描く
                     h, w = img1.shape
@@ -226,21 +320,31 @@ def main():
                     dst = cv2.perspectiveTransform(pts, M)
                     img2 = cv2.polylines(img2, [np.int32(dst)], True, (255, 255, 0), 3, cv2.LINE_AA)
 
-        draw_params = dict(matchColor=(0, 255, 0),     # 対応（インライア）を緑で表示
-                           singlePointColor=None,
-                           matchesMask=matchesMask,     # インライアのみ描画
-                           flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
-        img3 = cv2.drawMatches(img1, kp1, img2, kp2, good, None, **draw_params)
-        n_in = sum(matchesMask) if matchesMask else 0
-        cv2.putText(img3, "%s/%s  matches: %d  inliers: %d"
-                    % (args.feature, args.method, len(good), n_in), (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        img3 = cv2.resize(img3, None, fx=1.0 / args.scale, fy=1.0 / args.scale)
+        img3 = draw_correspondences(img1, kp1, img2, kp2, good, matchesMask, errors, args.reproj,
+                                    show_outliers, zoom=1.0 / args.scale)
+        put_label(img3, "%s/%s  matches: %d" % (args.feature, args.method, len(good)),
+                  (10, 30), (255, 255, 255))
+        # 表示が点滅しないよう、射影変換を推定できなかったフレームでも同じ行構成にする
+        hidden = "" if show_outliers else " (hidden, o)"
+        if matchesMask is None:
+            put_label(img3, "inliers: -  (no homography: %d candidates)" % len(good), (10, 60),
+                      COLOR_CANDIDATE)
+            put_label(img3, "outliers: -" + hidden, (10, 90), COLOR_OUTLIER)
+        else:
+            inlier_err = errors[np.array(matchesMask, bool)]
+            n_in = len(inlier_err)
+            stats = ("  error mean %.2f / max %.2f px" % (inlier_err.mean(), inlier_err.max())
+                     if n_in else "")
+            put_label(img3, "inliers: %d%s" % (n_in, stats), (10, 60), error_color(0, 1))
+            put_label(img3, "outliers: %d%s" % (len(good) - n_in, hidden), (10, 90), COLOR_OUTLIER)
+        draw_error_legend(img3, args.reproj, 20, img3.shape[0] - 40)    # 凡例は常に表示
         cv2.imshow("detect", img3)
 
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord('q')):
             break
+        elif key == ord('o'):
+            show_outliers = not show_outliers
         elif key == ord('t'):
             cv2.destroyWindow("detect")
             img1 = select_template_from_camera(cap, args.scale)
