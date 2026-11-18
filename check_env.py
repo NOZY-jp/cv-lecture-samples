@@ -160,6 +160,17 @@ if has_mp:
     result(all(os.path.exists(f) for f in tasks), "MediaPipe のモデル (models/*.task)",
            "python download_models.py でダウンロードしてください", required=False)
 
+print("--- 実行記録（課題の提出用）---")
+try:
+    sys.path.insert(0, HERE)
+    import receipt
+    inst = receipt.ensure_install_id()
+    result(inst["event"] != "mismatch", "インストール ID: %s…（%s 作成）" % (inst["local_id"][:8], inst["local_created"]),
+           "このフォルダは別の環境からコピーされた可能性があります。自分で clone し直してください",
+           required=False)
+except Exception as e:
+    result(False, "インストール ID を作成できません (%s)" % e, required=False)
+
 print("--- カメラ ---")
 cam = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 cap = cv2.VideoCapture(cam)

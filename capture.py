@@ -8,6 +8,7 @@ Webカメラから画像を1フレームずつ取り込み、キー操作で選�
     python capture.py            # カメラ番号 0 を使う
     python capture.py 1          # カメラ番号 1 を使う
     python capture.py movie.mp4  # カメラの代わりに動画ファイルを使う（繰り返し再生）
+    python capture.py --task 課題コード   # 課題の実行記録をとる（receipt.py を参照）
 
 キー操作は起動時にターミナルへ表示されます（README.md も参照）。
 
@@ -15,6 +16,7 @@ Webカメラから画像を1フレームずつ取り込み、キー操作で選�
 キー 'u' を押してください。
 """
 
+import argparse
 import os
 import sys
 import time
@@ -594,6 +596,7 @@ def print_help():
     print("  p     : 顔検出中に横顔検出の ON/OFF")
     print("  k     : 骨格推定中に平滑化の ON/OFF")
     print("  n     : NDI 送信の ON/OFF（ndi-python が必要・任意）")
+    print("  R     : 実行記録を保存（--task で起動したとき）")
     print("  ?     : ヘルプ表示の ON/OFF（ウィンドウ）")
     print("  q     : 終了")
     print("-" * 60)
@@ -687,6 +690,7 @@ def help_columns(st, ja):
                  ("p", "横顔検出 %s（顔検出 F の実行中）" % profile, COLOR_ITEM),
                  ("k", "骨格の平滑化 %s（骨格推定 K の実行中）" % smooth, COLOR_ITEM),
                  ("n", "NDI 送信 ON/OFF（任意機能）", COLOR_ITEM),
+                 ("R", "実行記録を保存（--task で起動したとき）", COLOR_ITEM),
                  ("?", "このヘルプを閉じる / 開く", COLOR_ITEM),
                  ("q", "終了", COLOR_ITEM)]
     else:
@@ -701,6 +705,7 @@ def help_columns(st, ja):
                  ("p", "profile face %s (during F)" % profile, COLOR_ITEM),
                  ("k", "pose smoothing %s (during K)" % smooth, COLOR_ITEM),
                  ("n", "NDI output ON/OFF (optional)", COLOR_ITEM),
+                 ("R", "save receipt (with --task)", COLOR_ITEM),
                  ("?", "close / open this help", COLOR_ITEM),
                  ("q", "quit", COLOR_ITEM)]
     return col1, col2
@@ -851,8 +856,58 @@ def open_source(arg):
     return cv2.VideoCapture(arg), True
 
 
+def draw_task_progress(img, recorder, drawer):
+    """課題の達成状況を画面の左下に表示する（--task で起動したとき）"""
+    H, W = img.shape[:2]
+    px = status_px(H) * 0.75
+    items = recorder.progress(japanese=drawer.japanese)
+    title = ("課題 %s（R: 記録を保存）" if drawer.japanese else "Task %s (R: save receipt)") % recorder.task_code
+    lines = [(title, (0, 255, 255), True)]
+    for text, done in items:
+        mark = ("[済] " if drawer.japanese else "[x] ") if done else "[  ] "
+        lines.append((mark + text, (0, 255, 0) if done else (255, 255, 255), False))
+    # 「?: ヘルプ」の表示の上に置き、背景を暗くして読みやすくする
+    line_h = px * 1.25
+    bottom = H - status_px(H) * 1.6
+    top = bottom - line_h * len(lines) - px * 0.4
+    width = max(drawer.width(t, px) for t, _, _ in lines) + px * 1.2
+    y0, y1, x1 = max(int(top), 0), int(bottom), min(int(width), W)
+    img[y0:y1, :x1] = (img[y0:y1, :x1] * 0.35).astype(np.uint8)
+    y = top + px * 0.2
+    for text, color, bold in lines:
+        y += line_h
+        drawer.put(img, text, (px * 0.6, y - px * 0.25), color, px, bold=bold)
+
+
+def save_receipt(recorder):
+    path, code = recorder.save()
+    print("-" * 60)
+    print("実行記録を保存しました: %s" % path)
+    print("確認コード: %s" % code)
+    for text, done in recorder.progress():
+        print("  [%s] %s" % ("済" if done else "  ", text))
+    print("このファイルを提出してください。")
+    print("-" * 60)
+
+
 def main():
-    cap, is_file = open_source(sys.argv[1] if len(sys.argv) > 1 else None)
+    parser = argparse.ArgumentParser(description="カメラキャプチャ＆画像処理サンプル")
+    parser.add_argument("source", nargs="?", default=None, help="カメラ番号 または 動画ファイル (default: 0)")
+    parser.add_argument("--task", default=None, help="課題コード（指定すると実行記録をとる）")
+    parser.add_argument("--id", default=None, help="学籍番号（--task のとき。省略すると入力を求める）")
+    args = parser.parse_args()
+
+    # 実行記録用のインストール ID（初回の実行時に作られる）
+    import receipt
+    try:
+        receipt.ensure_install_id()
+    except Exception:
+        pass
+    recorder = None
+    if args.task:
+        student_id = receipt.normalize(args.id) if args.id else receipt.ask_student_id()
+
+    cap, is_file = open_source(args.source)
 
     ret, img = cap.read()
     if not ret:
@@ -875,6 +930,13 @@ def main():
     show_help = SHOW_HELP_AT_START
     drawer = TextDrawer()
     help_cache = {}
+    if args.task:
+        recorder = receipt.Recorder(args.task, student_id, "file" if is_file else "camera",
+                                    (width, height), {name: k for k, (name, _, _) in PROCS.items()})
+        print("課題コード %s / 学籍番号 %s の課題:" % (recorder.task_code, recorder.student_id))
+        for text, _ in recorder.progress():
+            print("  " + text)
+        print("終了（q）または R キーで実行記録を保存します。")
 
     t_prev = time.perf_counter()
     while True:
@@ -935,6 +997,8 @@ def main():
         elif key == 'p' and st.proc == "facedetect":
             st.profile_face = not st.profile_face
             print("profile face mode" if st.profile_face else "frontal face mode")
+        elif key == 'R' and recorder is not None:
+            save_receipt(recorder)
         elif key == 'n':
             if ndi_send is None:
                 ndi_send, ndi_frame = NDI_setup()
@@ -943,8 +1007,11 @@ def main():
                 ndi_send = None
 
         # 前処理（ぼかし）→ 画像処理
+        raw = img
         img = blur(img, st)
         result = PROC_FUNCS[st.proc](img, st)
+        if recorder is not None:
+            recorder.record(st.proc, raw, st)
 
         # 表示
         if result.ndim == 2:
@@ -958,6 +1025,8 @@ def main():
         if not show_help:
             drawer.put(result, "?: ヘルプ" if drawer.japanese else "?: help",
                        (px * 0.5, height - px * 0.6), (0, 255, 0), px * 0.8)
+            if recorder is not None:
+                draw_task_progress(result, recorder, drawer)
         cv2.imshow(WINDOW_NAME, result)
 
         # NDI へ送信
@@ -966,6 +1035,8 @@ def main():
             ndi_frame.FourCC = ndi.FOURCC_VIDEO_TYPE_BGRX
             ndi.send_send_video_v2(ndi_send, ndi_frame)
 
+    if recorder is not None:
+        save_receipt(recorder)
     NDI_finish(ndi_send)
     cap.release()
     cv2.destroyAllWindows()
