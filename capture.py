@@ -72,6 +72,7 @@ class State:
         self.yunet = None         # YuNet（CNN による顔検出）
         self.pose = None          # MediaPipe Pose（人体の骨格推定）
         self.profile_face = True
+        self.found = None         # 検出系の処理が見つけた数（実行記録用。検出しない処理では None）
 
         # Lucas-Kanade 追跡用
         self.lk_fnum = 1000
@@ -403,14 +404,18 @@ def proc_facedetect(img, st):
         eyes = st.haar["eye"].detectMultiScale(roi_gray)
         for (ex, ey, ew, eh) in eyes:
             cv2.rectangle(roi_color, (ex, ey), (ex + ew, ey + eh), (0, 255, 0), 2)
+    st.found = len(faces)
     # 横顔（赤）: 学習データは片向きのみなので左右反転画像でも検出する
     if st.profile_face:
         W = gray.shape[1]
-        for (x, y, w, h) in st.haar["profile"].detectMultiScale(gray, 1.3, 5):
+        profiles = st.haar["profile"].detectMultiScale(gray, 1.3, 5)
+        for (x, y, w, h) in profiles:
             cv2.rectangle(result, (x, y), (x + w, y + h), (0, 0, 255), 2)
         flipped = cv2.flip(gray, 1)
-        for (x, y, w, h) in st.haar["profile"].detectMultiScale(flipped, 1.3, 5):
+        profiles_flipped = st.haar["profile"].detectMultiScale(flipped, 1.3, 5)
+        for (x, y, w, h) in profiles_flipped:
             cv2.rectangle(result, (W - 1 - x - w, y), (W - 1 - x, y + h), (0, 0, 255), 2)
+        st.found += len(profiles) + len(profiles_flipped)
     return result
 
 
@@ -419,8 +424,10 @@ def proc_bodydetect(img, st):
         return show_unavailable(img, "Haar cascade not available")
     result = img.copy()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    for (x, y, w, h) in st.haar["body"].detectMultiScale(gray, 1.3, 5):
+    bodies = st.haar["body"].detectMultiScale(gray, 1.3, 5)
+    for (x, y, w, h) in bodies:
         cv2.rectangle(result, (x, y), (x + w, y + h), (255, 0, 0), 2)
+    st.found = len(bodies)
     return result
 
 
@@ -431,6 +438,7 @@ def proc_yunet(img, st):
         return show_unavailable(img, "YuNet not available")
     result = img.copy()
     _, faces = st.yunet.detect(img)
+    st.found = 0 if faces is None else len(faces)
     if faces is None:
         return result
     # faces の各行: x, y, w, h, 右目x, 右目y, 左目x, 左目y, 鼻x, 鼻y, 口右x, 口右y, 口左x, 口左y, スコア
@@ -531,6 +539,7 @@ def proc_pose(img, st):
     import pose_estimation
     result = img.copy()
     res = st.pose.process(img)
+    st.found = 0 if res is None else 1
     if res is not None:
         pose_estimation.draw_pose(result, *res)
     return result
@@ -1010,6 +1019,7 @@ def main():
         # 前処理（ぼかし）→ 画像処理
         raw = img
         img = blur(img, st)
+        st.found = None
         result = PROC_FUNCS[st.proc](img, st)
         if recorder is not None:
             recorder.record(st.proc, raw, st)
