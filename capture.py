@@ -91,6 +91,10 @@ class State:
         self.sift = None
         self.clahe = None
 
+        # 二値化のしきい値: None なら大津の方法で毎フレーム自動、数値なら ←/→ で決めた手動の値
+        self.bin_manual = None
+        self.bin_last_otsu = 128      # 直近のフレームの大津のしきい値（手動に切り替えるときの起点）
+
     # --- ぼかしパラメータ（↑↓キーで変更、ESCでリセット）---
     def increase_param(self):
         self.gaussian_scale = min(self.gaussian_scale + 6, 149)
@@ -186,6 +190,8 @@ def proc_color(img, st):
 
 
 def proc_gray(img, st):
+    # グレースケール = 輝度 Y = 0.299R + 0.587G + 0.114B（YIQ や YUV の Y と同じ）
+    # 人の目は緑に最も敏感で青に鈍いので、緑の重みが大きい
     return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
 
@@ -224,17 +230,105 @@ def proc_angle(img, st):
 
 
 def proc_hue(img, st):
+    # 色相（H）だけを残し、彩度と明度を最大にして表示
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     hsv[:, :, 1] = 255
     hsv[:, :, 2] = 255
     return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
 
+def proc_saturation(img, st):
+    # 彩度（S）をグレースケールで表示: 鮮やかな色ほど白く、白・黒・灰色ほど黒い
+    # S = (max(R,G,B) - min(R,G,B)) / max(R,G,B)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    return hsv[:, :, 1]
+
+
+def proc_value(img, st):
+    # 明度（V）をグレースケールで表示: V = max(R,G,B)
+    # グレースケール（輝度 Y）と違い、純粋な赤・緑・青はどれも最大（白）になる
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    return hsv[:, :, 2]
+
+
+BIN_STEP = 2       # ←/→ 1 回で動かすしきい値の量
+
+
 def proc_binary(img, st):
-    # 大津の方法による二値化
+    # 二値化: ふだんは大津の方法でしきい値を自動で決める。
+    # ←/→ を押すと手動になり、画像が変わってもしきい値はその値に固定される（ESC で自動に戻る）
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, result = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    otsu, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    st.bin_last_otsu = int(otsu)
+    thresh = int(otsu) if st.bin_manual is None else st.bin_manual
+    _, binimg = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)   # thresh より大きい画素が白
+    result = cv2.cvtColor(binimg, cv2.COLOR_GRAY2BGR)
+    draw_histogram(result, gray, int(otsu), thresh, manual=st.bin_manual is not None)
     return result
+
+
+def shift_threshold(st, step):
+    """←/→ でしきい値を動かす。自動のときは、いまの大津の値を起点に手動に切り替える"""
+    base = st.bin_last_otsu if st.bin_manual is None else st.bin_manual
+    st.bin_manual = int(np.clip(base + step, 0, 255))
+
+
+def between_class_variance(hist):
+    """大津の方法の評価値: しきい値 t ごとのクラス間分散 σ_B²(t)。これが最大の t が大津のしきい値。
+    ω(t): t 以下の画素の割合, μ(t): t 以下の画素の (値 x 割合) の和, μ_T: 全体の平均として
+    σ_B²(t) = (μ_T ω(t) - μ(t))² / (ω(t) (1 - ω(t)))"""
+    p = hist / hist.sum()
+    omega = np.cumsum(p)
+    mu = np.cumsum(np.arange(256) * p)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        var = (mu[-1] * omega - mu) ** 2 / (omega * (1 - omega))
+    return np.nan_to_num(var)
+
+
+def draw_histogram(img, gray, otsu, thresh, manual=False):
+    """画像の右下にヒストグラムを重ねて表示する（横軸: 左が 0=黒, 右が 255=白）。
+    灰色の棒: 黒になる画素（しきい値以下）, 白の棒: 白になる画素,
+    水色の曲線: 大津の方法のクラス間分散, 緑の線: 大津のしきい値, 赤の線: 実際のしきい値。
+    白飛び・黒つぶれで 0 や 255 に画素が集中すると他の棒が見えなくなるので、
+    棒の高さは両端を除いたビンの最大に合わせ、それを超える両端はマゼンタで示す"""
+    H, W = img.shape[:2]
+    pw, ph = int(W * 0.45), int(H * 0.40)
+    x0, y0 = W - pw - 8, H - ph - 8
+    panel = img[y0:y0 + ph, x0:x0 + pw]
+    panel[:] = (panel * 0.25).astype(np.uint8)                   # 背景を暗くする
+    font, scale = cv2.FONT_HERSHEY_SIMPLEX, max(ph / 300.0, 0.33)
+    top, bottom = y0 + int(ph * 0.18), y0 + ph - int(ph * 0.12)  # 棒グラフを描く範囲
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+    xs = x0 + 4 + np.arange(256) * (pw - 8) / 255.0
+    ref = max(hist[1:255].max(), 1)                              # 両端を除いた最大
+    heights = np.minimum(hist / ref, 1.0) * (bottom - top)
+    for i in range(256):
+        if i in (0, 255) and hist[i] > ref:
+            color = (255, 0, 255)                                 # 飽和（白飛び・黒つぶれ）
+        else:
+            color = (110, 110, 110) if i <= thresh else (235, 235, 235)
+        cv2.line(img, (int(xs[i]), bottom), (int(xs[i]), int(bottom - heights[i])), color, 1)
+    var = between_class_variance(hist)
+    curve = np.stack([xs, bottom - var / max(var.max(), 1e-9) * (bottom - top)], axis=1)
+    cv2.polylines(img, [np.round(curve).astype(np.int32)], False, (255, 255, 0), 1, cv2.LINE_AA)
+    cv2.line(img, (int(xs[otsu]), top), (int(xs[otsu]), bottom), (0, 255, 0), 1, cv2.LINE_AA)
+    cv2.line(img, (int(xs[thresh]), top), (int(xs[thresh]), bottom), (0, 0, 255), 2, cv2.LINE_AA)
+    # 文字: しきい値、横軸の目盛り、飽和した画素の割合
+    mode = "manual, ESC: auto" if manual else "auto = Otsu, <-/->: manual"
+    cv2.putText(img, "Otsu %d  thresh %d (%s)" % (otsu, thresh, mode),
+                (x0 + 6, y0 + int(ph * 0.11)), font, scale, (255, 255, 255), 1, cv2.LINE_AA)
+    ty = y0 + ph - 4
+    cv2.putText(img, "0", (x0 + 4, ty), font, scale, (200, 200, 200), 1, cv2.LINE_AA)
+    (tw, _), _ = cv2.getTextSize("255", font, scale, 1)
+    cv2.putText(img, "255", (x0 + pw - tw - 4, ty), font, scale, (200, 200, 200), 1, cv2.LINE_AA)
+    total = hist.sum()
+    (w0, _), _ = cv2.getTextSize("0", font, scale, 1)
+    for i in (0, 255):
+        if hist[i] > ref:
+            label = "%d: %.1f%%" % (i, hist[i] / total * 100)
+            (lw, _), _ = cv2.getTextSize(label, font, scale, 1)
+            lx = x0 + 4 + w0 + 10 if i == 0 else x0 + pw - tw - 14 - lw   # 目盛りの内側に置く
+            cv2.putText(img, label, (lx, ty), font, scale, (255, 0, 255), 1, cv2.LINE_AA)
 
 
 def proc_sift(img, st):
@@ -455,12 +549,14 @@ def proc_custom(img, st):
 # ----------------------------------------------------------------------
 PROCS = {
     'c': ("color",         proc_color,         "カラー（そのまま）"),
-    'g': ("gray",          proc_gray,          "グレースケール"),
+    'g': ("gray",          proc_gray,          "グレースケール（輝度 Y：YIQ の Y）"),
     'x': ("sobelx",        proc_sobelx,        "Sobel フィルタ（x方向）"),
     'y': ("sobely",        proc_sobely,        "Sobel フィルタ（y方向）"),
     's': ("sobel",         proc_sobel,         "勾配強度"),
     'a': ("angle",         proc_angle,         "勾配方向（色相）と強度（明度）"),
     'h': ("hue",           proc_hue,           "色相のみ表示"),
+    'S': ("saturation",    proc_saturation,    "彩度のみ表示（HSV の S）"),
+    'V': ("value",         proc_value,         "明度のみ表示（HSV の V）"),
     'b': ("binary",        proc_binary,        "二値化（大津の方法）"),
     ':': ("sift",          proc_sift,          "SIFT 特徴点"),
     'f': ("denseflow",     proc_denseflow,     "密なオプティカルフロー（Farneback）"),
@@ -493,7 +589,8 @@ def print_help():
     for k, (_, desc) in BLURS.items():
         print("  %s : %s" % (k, desc))
     print("  ↑ / + : ぼかしを強く        ↓ / - : ぼかしを弱く")
-    print("  ESC   : ぼかしをリセット")
+    print("  ← / , : 二値化のしきい値を下げる  → / . : 上げる（b の実行中。押すと手動になり値が固定される）")
+    print("  ESC   : ぼかしをリセット・二値化のしきい値を自動（大津）に戻す")
     print("  p     : 顔検出中に横顔検出の ON/OFF")
     print("  k     : 骨格推定中に平滑化の ON/OFF")
     print("  n     : NDI 送信の ON/OFF（ndi-python が必要・任意）")
@@ -508,10 +605,11 @@ def print_help():
 #   OpenCV 4 では日本語が描けない（? になる）ので英語で表示する。
 # ----------------------------------------------------------------------
 HELP_EN = {   # OpenCV 4 用の英語の説明（ない処理は処理名をそのまま表示）
-    "color": "Color (as is)", "gray": "Grayscale",
+    "color": "Color (as is)", "gray": "Grayscale (luma Y of YIQ)",
     "sobelx": "Sobel filter (x)", "sobely": "Sobel filter (y)",
     "sobel": "Gradient magnitude", "angle": "Gradient direction (hue) & magnitude",
-    "hue": "Hue only", "binary": "Binarize (Otsu)", "sift": "SIFT keypoints",
+    "hue": "Hue only", "saturation": "Saturation only (S of HSV)", "value": "Value only (V of HSV)",
+    "binary": "Binarize (Otsu)", "sift": "SIFT keypoints",
     "denseflow": "Dense optical flow (Farneback)", "labeling": "Labeling",
     "labeling2": "Labeling + bounding box & centroid",
     "lktracking": "Feature tracking (Lucas-Kanade)",
@@ -580,10 +678,12 @@ def help_columns(st, ja):
     if ja:
         col2 += [("↑ / +", "ぼかしを強く", COLOR_ITEM),
                  ("↓ / -", "ぼかしを弱く", COLOR_ITEM),
-                 ("ESC", "ぼかしをリセット", COLOR_ITEM),
+                 ("ESC", "ぼかしをリセット・しきい値を自動に", COLOR_ITEM),
                  ("", "（現在: %s  %s）" % (st.blur_proc, param), COLOR_CURRENT),
                  ("", "", COLOR_ITEM),
                  ("", "その他", COLOR_HEAD),
+                 ("← / ,", "しきい値を下げる（b の実行中、手動に切替）", COLOR_ITEM),
+                 ("→ / .", "しきい値を上げる（b の実行中、手動に切替）", COLOR_ITEM),
                  ("p", "横顔検出 %s（顔検出 F の実行中）" % profile, COLOR_ITEM),
                  ("k", "骨格の平滑化 %s（骨格推定 K の実行中）" % smooth, COLOR_ITEM),
                  ("n", "NDI 送信 ON/OFF（任意機能）", COLOR_ITEM),
@@ -592,10 +692,12 @@ def help_columns(st, ja):
     else:
         col2 += [("Up / +", "stronger blur", COLOR_ITEM),
                  ("Down / -", "weaker blur", COLOR_ITEM),
-                 ("ESC", "reset blur", COLOR_ITEM),
+                 ("ESC", "reset blur, threshold to auto", COLOR_ITEM),
                  ("", "(now: %s  %s)" % (st.blur_proc, param), COLOR_CURRENT),
                  ("", "", COLOR_ITEM),
                  ("", "Others", COLOR_HEAD),
+                 ("Left / ,", "lower threshold (during b, manual)", COLOR_ITEM),
+                 ("Right / .", "raise threshold (during b, manual)", COLOR_ITEM),
                  ("p", "profile face %s (during F)" % profile, COLOR_ITEM),
                  ("k", "pose smoothing %s (during K)" % smooth, COLOR_ITEM),
                  ("n", "NDI output ON/OFF (optional)", COLOR_ITEM),
@@ -673,6 +775,8 @@ KEY_UP_CODES = {2490368}      # Windows
 KEY_DOWN_CODES = {2621440}    # Windows
 KEY_UP_LOW16 = {0xF700, 0xFF52}    # macOS, Linux
 KEY_DOWN_LOW16 = {0xF701, 0xFF54}  # macOS, Linux
+KEY_LEFT_CODES, KEY_RIGHT_CODES = {2424832}, {2555904}        # Windows
+KEY_LEFT_LOW16, KEY_RIGHT_LOW16 = {0xF702, 0xFF51}, {0xF703, 0xFF53}   # macOS, Linux
 
 
 def read_key():
@@ -690,6 +794,10 @@ def read_key():
         return "UP"
     if code in KEY_DOWN_CODES or low16 in KEY_DOWN_LOW16:
         return "DOWN"
+    if code in KEY_LEFT_CODES or low16 in KEY_LEFT_LOW16:
+        return "LEFT"
+    if code in KEY_RIGHT_CODES or low16 in KEY_RIGHT_LOW16:
+        return "RIGHT"
     if 0xF700 <= low16 <= 0xF8FF or 0xFF00 <= low16 <= 0xFFFF:
         return None  # その他の特殊キーは無視
     return chr(code & 0xFF)
@@ -794,8 +902,13 @@ def main():
             st.increase_param()
         elif key == "DOWN" or key == '-':
             st.decrease_param()
+        elif key in ("LEFT", ',') and st.proc == "binary":
+            shift_threshold(st, -BIN_STEP)
+        elif key in ("RIGHT", '.') and st.proc == "binary":
+            shift_threshold(st, BIN_STEP)
         elif key == chr(27):          # ESC
             st.reset_param()
+            st.bin_manual = None
         elif key == '?':
             show_help = not show_help
             if show_help:
@@ -808,6 +921,8 @@ def main():
             st.proc = PROCS[key][0]
             if st.proc == "lktracking":
                 st.lk_reset = True
+            if st.proc == "binary":
+                st.bin_manual = None
             if st.proc == "pose" and st.pose:
                 st.pose.reset()
             if st.proc in ("dog", "hist_eq", "hist_eq_CLAHE"):
