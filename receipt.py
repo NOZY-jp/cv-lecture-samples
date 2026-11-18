@@ -1,15 +1,15 @@
 # coding: utf-8
 """
-実行記録（提出用レシート）
+実行記録（提出用）
 
-課題で「自分の環境で実際に実行したこと」を確認するための仕組みです。
+課題で「自分の環境で実際に実行して、いろいろな機能を試したこと」を記録する仕組みです。
 
     python capture.py --task 課題コード            # 学籍番号を聞かれます
     python capture.py --task 課題コード --id 学籍番号
 
-で起動すると、画面の左下にあなた用の課題（使う処理など）が表示されます。
-課題をこなしてから q で終了すると（または R キーで）、receipts/ フォルダに
-記録ファイルが保存され、確認コードが表示されます。記録ファイルを提出してください。
+で起動すると、実行中の操作が記録されます（画面の左下に「記録中」と表示されます）。
+q で終了すると（または途中で R キーを押すと）、receipts/ フォルダに記録ファイルが保存され、
+確認コードが表示されます。記録ファイルを提出してください。
 
 記録に含まれるもの（画像は一切含みません）:
   ・学籍番号、課題コード、日時
@@ -17,7 +17,11 @@
     ユーザーの設定フォルダの 2 か所に保存されます）
   ・PC の識別情報をハッシュにしたもの（元の情報には戻せません）
   ・OS・Python・OpenCV の版、カメラの解像度、FPS
-  ・使った処理とフレーム数、処理中の数値の要約（入力画像の明るさ、二値化のしきい値など）
+  ・処理ごとのフレーム数・時間・切り替えた回数、キー操作の回数、
+    処理中の数値の要約（入力画像の明るさ、二値化のしきい値など）
+
+記録ファイルの本体は、記録（JSON）を圧縮して文字列にしたものに、改ざんを見つけるための
+検査用の値を付けたものです。書き換えると無効になります。
 
 注意: 同じ環境（フォルダのコピーや同じ PC）で複数の人の記録を作ると、提出物から分かります。
 """
@@ -29,7 +33,6 @@ import hmac
 import json
 import os
 import platform
-import sys
 import time
 import uuid
 import zlib
@@ -40,24 +43,14 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 RECEIPT_DIR = os.path.join(HERE, "receipts")
 LOCAL_ID_FILE = os.path.join(HERE, ".install_id")
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 # 記録の改ざんや写し間違いを見つけるための鍵（秘密ではありません）
 _CHECK_KEY = b"cv-lecture-samples/receipt/v1"
 # PC の識別情報をハッシュにするときに混ぜる値
 _MACHINE_SALT = b"cv-lecture-samples/machine/v1"
 
-# 課題で使うよう指定する処理の候補（追加のダウンロードが不要なもの）
-TASK_MODE_CANDIDATES = ["h", "S", "V", "x", "y", "s", "a", ":", "f", "l", ";", "d", "e", "E",
-                        "F", "Y"]
-TASK_MIN_FRAMES = 60        # 指定した処理を使うフレーム数
-TASK_HOLD_FRAMES = 30       # 指定したしきい値で二値化を続けるフレーム数
-TASK_TOLERANCE = 1          # しきい値の許容差（矢印キーは 2 ずつ動くので ±1 を認める）
-
-
-def held_frames(manual, target, tolerance=TASK_TOLERANCE):
-    """手動しきい値ごとのフレーム数 {"137": 40, ...} から、target±tolerance で続けたフレーム数"""
-    return sum(n for t, n in manual.items() if abs(int(t) - target) <= tolerance)
+USED_MIN_FRAMES = 30        # 画面の「使った機能」に数えるフレーム数
 
 
 # ----------------------------------------------------------------------
@@ -132,44 +125,45 @@ def machine_hash():
 
 
 # ----------------------------------------------------------------------
-# 課題の割り当て（課題コードと学籍番号から決まる。教員側でも同じ計算で確認する）
+# 記録
 # ----------------------------------------------------------------------
 def normalize(text):
     return "".join(str(text).split()).upper()
 
 
-def assign_tasks(task_code, student_id):
-    h = hashlib.sha256(("%s|%s" % (normalize(task_code), normalize(student_id))).encode("utf-8")).digest()
-    threshold = 70 + int.from_bytes(h[:2], "big") % 121              # 70〜190
-    order = sorted(TASK_MODE_CANDIDATES, key=lambda k: hashlib.sha256(h + k.encode()).digest())
-    return {"threshold": threshold, "modes": order[:3],
-            "min_frames": TASK_MIN_FRAMES, "hold_frames": TASK_HOLD_FRAMES}
-
-
-# ----------------------------------------------------------------------
-# 記録
-# ----------------------------------------------------------------------
 class Recorder:
-    def __init__(self, task_code, student_id, source, frame_size, key_of_proc):
+    """処理ごとの利用状況と、キー操作の回数を記録する"""
+
+    def __init__(self, task_code, student_id, source, frame_size):
         self.task_code = normalize(task_code)
         self.student_id = normalize(student_id)
-        self.tasks = assign_tasks(self.task_code, self.student_id)
         self.source = source                    # "camera" または "file"
         self.frame_size = frame_size            # (幅, 高さ)
-        self.key_of_proc = key_of_proc          # 処理名 → キー
         self.install = ensure_install_id()
         self.machine, self.machine_reliable = machine_hash()
         self.started = time.time()
+        self.started_iso = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
         self.prev_t = None
+        self.prev_proc = None
         self.frames = 0
-        self.modes = {}
-        self.saved_path = None
+        self.switches = 0                       # 処理を切り替えた回数（合計）
+        self.modes = {}                         # 処理名 → 利用状況
+        self.keys = {}                          # "キー@処理名" → 押した回数
+        self.saves = 0
 
     def _mode(self, proc):
         if proc not in self.modes:
-            self.modes[proc] = {"frames": 0, "seconds": 0.0,
+            self.modes[proc] = {"frames": 0, "seconds": 0.0, "entries": 0,
                                 "bright_sum": 0.0, "bright_sq": 0.0, "bright_min": 255.0, "bright_max": 0.0}
         return self.modes[proc]
+
+    def on_key(self, key, proc):
+        """キーが押されたときに呼ぶ。proc は押した時点で実行中の処理"""
+        if key is None:
+            return
+        name = {chr(27): "ESC", " ": "SPACE"}.get(key, key)
+        k = "%s@%s" % (name, proc)
+        self.keys[k] = self.keys.get(k, 0) + 1
 
     def record(self, proc, img, st):
         """1 フレームごとに呼ぶ。img は処理前の入力画像"""
@@ -178,6 +172,11 @@ class Recorder:
         self.prev_t = t
         self.frames += 1
         m = self._mode(proc)
+        if proc != self.prev_proc:
+            m["entries"] += 1
+            if self.prev_proc is not None:
+                self.switches += 1
+            self.prev_proc = proc
         m["frames"] += 1
         m["seconds"] += dt
         b = float(cv2.cvtColor(cv2.resize(img, (64, 48)), cv2.COLOR_BGR2GRAY).mean())
@@ -196,24 +195,10 @@ class Recorder:
                 held = m.setdefault("manual", {})
                 held[str(manual)] = held.get(str(manual), 0) + 1
 
-    # --- 課題の達成状況 ---
-    def progress(self, japanese=True):
-        """[(説明, 達成したか), ...]"""
-        tk = self.tasks
-        held = held_frames(self.modes.get("binary", {}).get("manual", {}), tk["threshold"])
-        n, need = min(held, tk["hold_frames"]), tk["hold_frames"]
-        text = ("b: しきい値を手動で %d（±%d）にする（%d/%d）" if japanese
-                else "b: set threshold to %d (+-%d) manually (%d/%d)") % (
-            tk["threshold"], TASK_TOLERANCE, n, need)
-        items = [(text, held >= need)]
-        for key in tk["modes"]:
-            proc = next((p for p, k in self.key_of_proc.items() if k == key), key)
-            count = self.modes.get(proc, {}).get("frames", 0)
-            need = tk["min_frames"]
-            text = ("%s: %s を使う（%d/%d）" if japanese else "%s: use %s (%d/%d)") % (
-                key, proc, min(count, need), need)
-            items.append((text, count >= need))
-        return items
+    def summary(self):
+        """(使った機能の数, 切り替えた回数, 記録したフレーム数)"""
+        used = sum(1 for m in self.modes.values() if m["frames"] >= USED_MIN_FRAMES)
+        return used, self.switches, self.frames
 
     # --- 保存 ---
     def payload(self):
@@ -221,7 +206,7 @@ class Recorder:
         for proc, m in self.modes.items():
             n = max(m["frames"], 1)
             mean = m["bright_sum"] / n
-            entry = {"frames": m["frames"], "seconds": round(m["seconds"], 2),
+            entry = {"frames": m["frames"], "seconds": round(m["seconds"], 2), "entries": m["entries"],
                      "bright_mean": round(mean, 2),
                      "bright_std": round(max(m["bright_sq"] / n - mean * mean, 0.0) ** 0.5, 2),
                      "bright_min": round(m["bright_min"], 2), "bright_max": round(m["bright_max"], 2)}
@@ -236,22 +221,22 @@ class Recorder:
             "version": FORMAT_VERSION,
             "student_id": self.student_id,
             "task_code": self.task_code,
-            "tasks": self.tasks,
-            "progress": [[text, done] for text, done in self.progress()],
             "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
             "install": self.install,
             "machine": {"hash": self.machine, "reliable": self.machine_reliable},
             "env": {"os": platform.platform(), "python": platform.python_version(),
                     "opencv": cv2.__version__, "numpy": np.__version__},
-            "session": {"source": self.source, "frame_size": list(self.frame_size),
-                        "frames": self.frames, "seconds": round(elapsed, 2),
-                        "fps": round(self.frames / max(elapsed, 1e-6), 2)},
+            "session": {"started": self.started_iso, "source": self.source, "frame_size": list(self.frame_size),
+                        "frames": self.frames, "seconds": round(elapsed, 2), "switches": self.switches,
+                        "fps": round(self.frames / max(elapsed, 1e-6), 2), "saves": self.saves + 1},
             "modes": modes,
+            "keys": self.keys,
         }
 
     def save(self):
         """記録ファイルを保存し、(ファイルのパス, 確認コード) を返す"""
         data = self.payload()
+        self.saves += 1
         body = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         sig = hmac.new(_CHECK_KEY, body.encode("utf-8"), hashlib.sha256).hexdigest()
         blob = base64.b64encode(zlib.compress(json.dumps({"data": data, "sig": sig},
@@ -260,23 +245,24 @@ class Recorder:
         os.makedirs(RECEIPT_DIR, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         path = os.path.join(RECEIPT_DIR, "receipt_%s_%s_%s.txt" % (self.student_id, self.task_code, stamp))
+        used = sorted((p for p, m in self.modes.items() if m["frames"] >= USED_MIN_FRAMES),
+                      key=lambda p: -self.modes[p]["frames"])
         lines = ["# 実行記録（このファイルを提出してください）",
                  "# 学籍番号: %s   課題コード: %s   作成: %s" % (self.student_id, self.task_code, data["created"]),
                  "# 確認コード: %s" % code,
-                 "# 課題の達成状況:"]
-        lines += ["#   [%s] %s" % ("済" if done else "  ", text) for text, done in self.progress()]
-        lines += ["# 以下は記録の本体です（書き換えると無効になります）",
-                  "-----BEGIN RECEIPT-----"]
+                 "# 記録したフレーム数: %d   処理を切り替えた回数: %d" % (self.frames, self.switches),
+                 "# 使った機能（%d フレーム以上）: %s" % (USED_MIN_FRAMES, ", ".join(used) if used else "なし"),
+                 "# 以下は記録の本体です（書き換えると無効になります）",
+                 "-----BEGIN RECEIPT-----"]
         lines += [blob[i:i + 76] for i in range(0, len(blob), 76)]
         lines += ["-----END RECEIPT-----", ""]
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
-        self.saved_path = path
         return path, code
 
 
 def decode_receipt(text):
-    """記録ファイルの本文から (データ, 署名が正しいか) を返す（教員用の確認スクリプトから使う）"""
+    """記録ファイルの本文から (データ, 検査用の値が正しいか, 検査用の値) を返す（教員用の確認スクリプトから使う）"""
     inside = text.split("-----BEGIN RECEIPT-----", 1)[1].split("-----END RECEIPT-----", 1)[0]
     obj = json.loads(zlib.decompress(base64.b64decode("".join(inside.split()))).decode("utf-8"))
     data, sig = obj["data"], obj["sig"]

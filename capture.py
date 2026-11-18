@@ -856,27 +856,29 @@ def open_source(arg):
     return cv2.VideoCapture(arg), True
 
 
-def draw_task_progress(img, recorder, drawer):
-    """課題の達成状況を画面の左下に表示する（--task で起動したとき）"""
+def draw_recording_status(img, recorder, drawer):
+    """実行記録をとっていることを画面の左下に表示する（--task で起動したとき）"""
     H, W = img.shape[:2]
     px = status_px(H) * 0.75
-    items = recorder.progress(japanese=drawer.japanese)
-    title = ("課題 %s（R: 記録を保存）" if drawer.japanese else "Task %s (R: save receipt)") % recorder.task_code
-    lines = [(title, (0, 255, 255), True)]
-    for text, done in items:
-        mark = ("[済] " if drawer.japanese else "[x] ") if done else "[  ] "
-        lines.append((mark + text, (0, 255, 0) if done else (255, 255, 255), False))
+    used, switches, frames = recorder.summary()
+    if drawer.japanese:
+        lines = ["● 記録中  %s / %s（R: 保存）" % (recorder.task_code, recorder.student_id),
+                 "使った機能 %d   切り替え %d 回   %d フレーム" % (used, switches, frames)]
+    else:
+        lines = ["REC  %s / %s (R: save)" % (recorder.task_code, recorder.student_id),
+                 "features %d   switches %d   frames %d" % (used, switches, frames)]
     # 「?: ヘルプ」の表示の上に置き、背景を暗くして読みやすくする
     line_h = px * 1.25
     bottom = H - status_px(H) * 1.6
     top = bottom - line_h * len(lines) - px * 0.4
-    width = max(drawer.width(t, px) for t, _, _ in lines) + px * 1.2
+    width = max(drawer.width(t, px) for t in lines) + px * 1.2
     y0, y1, x1 = max(int(top), 0), int(bottom), min(int(width), W)
     img[y0:y1, :x1] = (img[y0:y1, :x1] * 0.35).astype(np.uint8)
     y = top + px * 0.2
-    for text, color, bold in lines:
+    for i, text in enumerate(lines):
         y += line_h
-        drawer.put(img, text, (px * 0.6, y - px * 0.25), color, px, bold=bold)
+        drawer.put(img, text, (px * 0.6, y - px * 0.25), (80, 80, 255) if i == 0 else (255, 255, 255),
+                   px, bold=(i == 0))
 
 
 def save_receipt(recorder):
@@ -884,8 +886,8 @@ def save_receipt(recorder):
     print("-" * 60)
     print("実行記録を保存しました: %s" % path)
     print("確認コード: %s" % code)
-    for text, done in recorder.progress():
-        print("  [%s] %s" % ("済" if done else "  ", text))
+    used, switches, frames = recorder.summary()
+    print("使った機能 %d   切り替え %d 回   %d フレーム" % (used, switches, frames))
     print("このファイルを提出してください。")
     print("-" * 60)
 
@@ -931,12 +933,9 @@ def main():
     drawer = TextDrawer()
     help_cache = {}
     if args.task:
-        recorder = receipt.Recorder(args.task, student_id, "file" if is_file else "camera",
-                                    (width, height), {name: k for k, (name, _, _) in PROCS.items()})
-        print("課題コード %s / 学籍番号 %s の課題:" % (recorder.task_code, recorder.student_id))
-        for text, _ in recorder.progress():
-            print("  " + text)
-        print("終了（q）または R キーで実行記録を保存します。")
+        recorder = receipt.Recorder(args.task, student_id, "file" if is_file else "camera", (width, height))
+        print("課題コード %s / 学籍番号 %s で実行記録をとります。" % (recorder.task_code, recorder.student_id))
+        print("いろいろな機能を試してください。終了（q）または R キーで記録を保存します。")
 
     t_prev = time.perf_counter()
     while True:
@@ -956,8 +955,10 @@ def main():
         # 処理速度のため縮小
         img = cv2.resize(img, proc_size)
 
-        # キー入力
+        # キー入力（実行記録をとっているときは、どの処理の実行中に押したかを記録）
         key = read_key()
+        if recorder is not None:
+            recorder.on_key(key, st.proc)
         if key == 'q':
             break
         elif key == "UP" or key == '+':
@@ -1026,7 +1027,7 @@ def main():
             drawer.put(result, "?: ヘルプ" if drawer.japanese else "?: help",
                        (px * 0.5, height - px * 0.6), (0, 255, 0), px * 0.8)
             if recorder is not None:
-                draw_task_progress(result, recorder, drawer)
+                draw_recording_status(result, recorder, drawer)
         cv2.imshow(WINDOW_NAME, result)
 
         # NDI へ送信
