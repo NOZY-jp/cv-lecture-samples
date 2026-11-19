@@ -14,10 +14,12 @@ RANSAC で射影変換行列（ホモグラフィ）を推定して、カメラ�
     python flann.py --feature akaze          # 特徴量を変更 (sift/surf/kaze/akaze/brisk/orb)
     python flann.py --method magsac          # ロバスト推定法を変更 (ransac/magsac)
     python flann.py --reproj 3               # インライアとみなす再投影誤差の閾値 [画素]
+    python flann.py --task 課題コード         # 課題の実行記録をとる（receipt.py を参照）
 
 キー操作（画像ウィンドウを選択した状態で）:
     o   : アウトライア（RANSAC で外れ値とされた対応）の表示 ON/OFF
     t   : カメラ画像からテンプレートを選び直す
+    R   : 実行記録を保存（--task で起動したとき）
     ESC / q : 終了
 
 対応点の線の色:
@@ -29,6 +31,7 @@ RANSAC で射影変換行列（ホモグラフィ）を推定して、カメラ�
 
 import argparse
 import sys
+import types
 
 import cv2
 import numpy as np
@@ -259,10 +262,22 @@ def main():
                         help="インライアとみなす再投影誤差の閾値 [縮小後の画像の画素] (default: 5)")
     parser.add_argument("--scale", type=float, default=0.5,
                         help="処理のためにカメラ画像を縮小する倍率 (default: 0.5)")
+    parser.add_argument("--task", default=None, help="課題コード（指定すると実行記録をとる）")
+    parser.add_argument("--id", default=None, help="学籍番号（--task のとき。省略すると入力を求める）")
     # 互換のため、オプションなしの数字もカメラ番号として受け付ける（python flann.py 1）
     parser.add_argument("camera_pos", nargs="?", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     cam = args.camera_pos if args.camera_pos is not None else args.camera
+
+    # 実行記録用のインストール ID（初回の実行時に作られる）
+    import receipt
+    try:
+        receipt.ensure_install_id()
+    except Exception:
+        pass
+    recorder = None
+    if args.task:
+        student_id = receipt.normalize(args.id) if args.id else receipt.ask_student_id()
 
     cap = cv2.VideoCapture(cam)
     if not cap.isOpened():
@@ -289,6 +304,11 @@ def main():
         img1 = select_template_from_camera(cap, args.scale)
     kp1, des1 = prepare(img1)
 
+    mode = "flann:%s/%s" % (args.feature, args.method)          # 実行記録での処理名
+    if args.task:
+        w0, h0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        recorder = receipt.Recorder(args.task, student_id, "camera", (w0, h0), script="flann")
+        print("課題コード %s / 学籍番号 %s で実行記録をとります（R: 保存）。" % (recorder.task_code, recorder.student_id))
     print("o: アウトライアの表示 ON/OFF   t: テンプレートを選び直す   ESC/q: 終了")
     print("線の色  緑〜オレンジ: インライア（再投影誤差が小さいほど緑）  赤: アウトライア  黄: RANSAC 前の候補")
     show_outliers = True
@@ -299,6 +319,7 @@ def main():
             print("image not captured. stop.")
             break
         img2 = cv2.resize(img2, None, fx=args.scale, fy=args.scale)
+        raw = img2.copy() if recorder is not None else None
         kp2, des2 = detector.detectAndCompute(img2, None)
 
         good = []
@@ -342,11 +363,24 @@ def main():
             put_label(img3, "inliers: %d%s" % (n_in, stats), (10, 60), error_color(0, 1))
             put_label(img3, "outliers: %d%s" % (len(good) - n_in, hidden), (10, 90), COLOR_OUTLIER)
         draw_error_legend(img3, args.reproj, 20, img3.shape[0] - 40)    # 凡例は常に表示
+        if recorder is not None:
+            detected = matchesMask is not None and sum(matchesMask) >= 4
+            n_in = sum(matchesMask) if matchesMask else 0
+            err = float(errors[np.array(matchesMask, bool)].mean()) if n_in else None
+            recorder.record(mode, raw, types.SimpleNamespace(found=1 if detected else 0),
+                            values={"matches": len(good), "inliers": n_in, "error_mean": err})
+            rec = "REC %s / %s  (R: save)" % (recorder.task_code, recorder.student_id)
+            (tw, _), _ = cv2.getTextSize(rec, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            put_label(img3, rec, (img3.shape[1] - tw - 12, 30), (80, 80, 255), 0.6)
         cv2.imshow("detect", img3)
 
         key = cv2.waitKey(1) & 0xFF
+        if recorder is not None and key != 255:
+            recorder.on_key(chr(key), mode)
         if key in (27, ord('q')):
             break
+        elif key == ord('R') and recorder is not None:
+            save_receipt(recorder)
         elif key == ord('o'):
             show_outliers = not show_outliers
         elif key == ord('t'):
@@ -354,9 +388,20 @@ def main():
             img1 = select_template_from_camera(cap, args.scale)
             kp1, des1 = prepare(img1)
 
+    if recorder is not None:
+        save_receipt(recorder)
     cap.release()
     cv2.destroyAllWindows()
     cv2.waitKey(1)
+
+
+def save_receipt(recorder):
+    path, code = recorder.save()
+    print("-" * 60)
+    print("実行記録を保存しました: %s" % path)
+    print("確認コード: %s" % code)
+    print("このファイルを提出してください。")
+    print("-" * 60)
 
 
 if __name__ == "__main__":

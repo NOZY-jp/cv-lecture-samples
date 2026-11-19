@@ -44,7 +44,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 RECEIPT_DIR = os.path.join(HERE, "receipts")
 LOCAL_ID_FILE = os.path.join(HERE, ".install_id")
-FORMAT_VERSION = 4
+FORMAT_VERSION = 5
 
 # 記録の改ざんや写し間違いを見つけるための鍵（秘密ではありません）
 _CHECK_KEY = b"cv-lecture-samples/receipt/v1"
@@ -135,7 +135,8 @@ def normalize(text):
 class Recorder:
     """処理ごとの利用状況と、キー操作の回数を記録する"""
 
-    def __init__(self, task_code, student_id, source, frame_size):
+    def __init__(self, task_code, student_id, source, frame_size, script="capture"):
+        self.script = script                    # 記録をとったスクリプト（capture / flann）
         self.task_code = normalize(task_code)
         self.student_id = normalize(student_id)
         self.source = source                    # "camera" または "file"
@@ -166,8 +167,9 @@ class Recorder:
         k = "%s@%s" % (name, proc)
         self.keys[k] = self.keys.get(k, 0) + 1
 
-    def record(self, proc, img, st, param_value=None):
-        """1 フレームごとに呼ぶ。img は処理前の入力画像、param_value は ←/→ で変えるパラメータの値"""
+    def record(self, proc, img, st, param_value=None, values=None):
+        """1 フレームごとに呼ぶ。img は処理前の入力画像、param_value は ←/→ で変えるパラメータの値、
+        values は {名前: 数値} の辞書で、名前ごとに平均・ばらつき・最小・最大を記録する"""
         t = time.time()
         dt = 0.0 if self.prev_t is None else min(t - self.prev_t, 1.0)
         self.prev_t = t
@@ -185,6 +187,15 @@ class Recorder:
         m["bright_sq"] += b * b
         m["bright_min"] = min(m["bright_min"], b)
         m["bright_max"] = max(m["bright_max"], b)
+        for name, v in (values or {}).items():      # 数値の要約（flann.py の対応の数など）
+            if v is None:
+                continue
+            s = m.setdefault("stats", {}).setdefault(name, [0, 0.0, 0.0, float(v), float(v)])
+            s[0] += 1
+            s[1] += float(v)
+            s[2] += float(v) ** 2
+            s[3] = min(s[3], float(v))
+            s[4] = max(s[4], float(v))
         if param_value is not None:                 # パラメータの値ごとのフレーム数
             pv = m.setdefault("params", {})
             pv[str(param_value)] = pv.get(str(param_value), 0) + 1
@@ -227,10 +238,17 @@ class Recorder:
             for k in ("detect_frames", "found_frames", "found_total", "params"):
                 if k in m:
                     entry[k] = m[k]
+            if "stats" in m:
+                entry["stats"] = {}
+                for name, (cnt, sm, sq, mn, mx) in m["stats"].items():
+                    mean = sm / cnt
+                    entry["stats"][name] = {"n": cnt, "mean": round(mean, 3), "min": round(mn, 3), "max": round(mx, 3),
+                                            "std": round(max(sq / cnt - mean * mean, 0.0) ** 0.5, 3)}
             modes[proc] = entry
         elapsed = time.time() - self.started
         return {
             "version": FORMAT_VERSION,
+            "script": self.script,
             "student_id": self.student_id,
             "task_code": self.task_code,
             "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
