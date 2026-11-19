@@ -18,7 +18,8 @@ q で終了すると（または途中で R キーを押すと）、receipts/ �
   ・PC の識別情報をハッシュにしたもの（元の情報には戻せません）
   ・OS・Python・OpenCV の版、カメラの解像度、FPS
   ・処理ごとのフレーム数・時間・切り替えた回数、キー操作の回数、
-    処理中の数値の要約（入力画像の明るさ、二値化のしきい値、顔や骨格が見つかったフレーム数など）
+    ←/→ で変えたパラメータの値ごとのフレーム数、処理中の数値の要約（入力画像の明るさ、
+    二値化のしきい値、顔・人物・骨格・直線・円が見つかったフレーム数など）
 
 記録ファイルの本体は、記録（JSON）を圧縮して文字列にしたものに、改ざんを見つけるための
 検査用の値を付けたものです。書き換えると無効になります。
@@ -43,7 +44,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 RECEIPT_DIR = os.path.join(HERE, "receipts")
 LOCAL_ID_FILE = os.path.join(HERE, ".install_id")
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 
 # 記録の改ざんや写し間違いを見つけるための鍵（秘密ではありません）
 _CHECK_KEY = b"cv-lecture-samples/receipt/v1"
@@ -165,8 +166,8 @@ class Recorder:
         k = "%s@%s" % (name, proc)
         self.keys[k] = self.keys.get(k, 0) + 1
 
-    def record(self, proc, img, st):
-        """1 フレームごとに呼ぶ。img は処理前の入力画像"""
+    def record(self, proc, img, st, param_value=None):
+        """1 フレームごとに呼ぶ。img は処理前の入力画像、param_value は ←/→ で変えるパラメータの値"""
         t = time.time()
         dt = 0.0 if self.prev_t is None else min(t - self.prev_t, 1.0)
         self.prev_t = t
@@ -184,7 +185,10 @@ class Recorder:
         m["bright_sq"] += b * b
         m["bright_min"] = min(m["bright_min"], b)
         m["bright_max"] = max(m["bright_max"], b)
-        found = getattr(st, "found", None)          # 顔・上半身・骨格の検出で見つけた数
+        if param_value is not None:                 # パラメータの値ごとのフレーム数
+            pv = m.setdefault("params", {})
+            pv[str(param_value)] = pv.get(str(param_value), 0) + 1
+        found = getattr(st, "found", None)          # 検出系の処理（顔・人物・骨格・直線・円）で見つけた数
         if found is not None:
             m["detect_frames"] = m.get("detect_frames", 0) + 1
             m["found_frames"] = m.get("found_frames", 0) + (1 if found > 0 else 0)
@@ -220,7 +224,7 @@ class Recorder:
                                  "mean": round(m["otsu"]["sum"] / n, 2)}
             if "manual" in m:
                 entry["manual"] = m["manual"]
-            for k in ("detect_frames", "found_frames", "found_total"):
+            for k in ("detect_frames", "found_frames", "found_total", "params"):
                 if k in m:
                     entry[k] = m[k]
             modes[proc] = entry

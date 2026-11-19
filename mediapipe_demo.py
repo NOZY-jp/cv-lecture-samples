@@ -275,7 +275,9 @@ def main():
         status = "FPS:%.1f  [f]Face:%s [b]Blend:%s [p]Pose:%s [h]Hand:%s [m]Mirror:%s  [q]quit" % (
             fps, onoff(enabled["face"]), onoff(show_blendshapes), onoff(enabled["pose"]),
             onoff(enabled["hand"]), onoff(mirror))
-        cv2.putText(img, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+        # ふちは同じ太さの黒い文字をずらして重ねる（OpenCV 5 では太さで文字の幅が変わるため）
+        for dx, dy in ((-2, 0), (2, 0), (0, -2), (0, 2), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+            cv2.putText(img, status, (10 + dx, 30 + dy), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
         cv2.putText(img, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
         cv2.imshow("MediaPipe demo", img)
 
