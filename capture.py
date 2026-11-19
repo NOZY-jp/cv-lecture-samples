@@ -91,6 +91,11 @@ class State:
         self.sift = None
         self.clahe = None
 
+        # ←/→ で変える処理ごとのパラメータ（PARAMS の値の候補の何番目か）と、ヒストグラム表示
+        self.param_index = {}
+        self.show_hist = True
+        self.hog = None           # HOG 特徴 + SVM の人物検出器
+
         # 二値化のしきい値: None なら大津の方法で毎フレーム自動、数値なら ←/→ で決めた手動の値
         self.bin_manual = None
         self.bin_last_otsu = 128      # 直近のフレームの大津のしきい値（手動に切り替えるときの起点）
@@ -192,7 +197,17 @@ def proc_color(img, st):
 def proc_gray(img, st):
     # グレースケール = 輝度 Y = 0.299R + 0.587G + 0.114B（YIQ や YUV の Y と同じ）
     # 人の目は緑に最も敏感で青に鈍いので、緑の重みが大きい
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return with_histogram(gray, st)
+
+
+def with_histogram(gray, st):
+    """グレースケール画像に、そのヒストグラムを重ねる（i キーで ON/OFF）"""
+    if not st.show_hist:
+        return gray
+    result = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    draw_histogram(result, gray)
+    return result
 
 
 def _sobel(img, dx, dy, ksize=1):
@@ -263,7 +278,8 @@ def proc_binary(img, st):
     thresh = int(otsu) if st.bin_manual is None else st.bin_manual
     _, binimg = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)   # thresh より大きい画素が白
     result = cv2.cvtColor(binimg, cv2.COLOR_GRAY2BGR)
-    draw_histogram(result, gray, int(otsu), thresh, manual=st.bin_manual is not None)
+    if st.show_hist:
+        draw_histogram(result, gray, int(otsu), thresh, manual=st.bin_manual is not None)
     return result
 
 
@@ -285,9 +301,9 @@ def between_class_variance(hist):
     return np.nan_to_num(var)
 
 
-def draw_histogram(img, gray, otsu, thresh, manual=False):
+def draw_histogram(img, gray, otsu=None, thresh=None, manual=False):
     """画像の右下にヒストグラムを重ねて表示する（横軸: 左が 0=黒, 右が 255=白）。
-    灰色の棒: 黒になる画素（しきい値以下）, 白の棒: 白になる画素,
+    二値化（thresh を指定）のとき: 灰色の棒: 黒になる画素（しきい値以下）, 白の棒: 白になる画素,
     水色の曲線: 大津の方法のクラス間分散, 緑の線: 大津のしきい値, 赤の線: 実際のしきい値。
     白飛び・黒つぶれで 0 や 255 に画素が集中すると他の棒が見えなくなるので、
     棒の高さは両端を除いたビンの最大に合わせ、それを超える両端はマゼンタで示す"""
@@ -305,18 +321,23 @@ def draw_histogram(img, gray, otsu, thresh, manual=False):
     for i in range(256):
         if i in (0, 255) and hist[i] > ref:
             color = (255, 0, 255)                                 # 飽和（白飛び・黒つぶれ）
+        elif thresh is None:
+            color = (200, 200, 200)
         else:
             color = (110, 110, 110) if i <= thresh else (235, 235, 235)
         cv2.line(img, (int(xs[i]), bottom), (int(xs[i]), int(bottom - heights[i])), color, 1)
-    var = between_class_variance(hist)
-    curve = np.stack([xs, bottom - var / max(var.max(), 1e-9) * (bottom - top)], axis=1)
-    cv2.polylines(img, [np.round(curve).astype(np.int32)], False, (255, 255, 0), 1, cv2.LINE_AA)
-    cv2.line(img, (int(xs[otsu]), top), (int(xs[otsu]), bottom), (0, 255, 0), 1, cv2.LINE_AA)
-    cv2.line(img, (int(xs[thresh]), top), (int(xs[thresh]), bottom), (0, 0, 255), 2, cv2.LINE_AA)
-    # 文字: しきい値、横軸の目盛り、飽和した画素の割合
-    mode = "manual, ESC: auto" if manual else "auto = Otsu, <-/->: manual"
-    cv2.putText(img, "Otsu %d  thresh %d (%s)" % (otsu, thresh, mode),
-                (x0 + 6, y0 + int(ph * 0.11)), font, scale, (255, 255, 255), 1, cv2.LINE_AA)
+    if thresh is not None:
+        var = between_class_variance(hist)
+        curve = np.stack([xs, bottom - var / max(var.max(), 1e-9) * (bottom - top)], axis=1)
+        cv2.polylines(img, [np.round(curve).astype(np.int32)], False, (255, 255, 0), 1, cv2.LINE_AA)
+        cv2.line(img, (int(xs[otsu]), top), (int(xs[otsu]), bottom), (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.line(img, (int(xs[thresh]), top), (int(xs[thresh]), bottom), (0, 0, 255), 2, cv2.LINE_AA)
+        mode = "manual, ESC: auto" if manual else "auto = Otsu, <-/->: manual"
+        title = "Otsu %d  thresh %d (%s)" % (otsu, thresh, mode)
+    else:
+        title = "histogram  (mean %.1f)  i: hide" % float(gray.mean())
+    # 文字: タイトル、横軸の目盛り、飽和した画素の割合
+    cv2.putText(img, title, (x0 + 6, y0 + int(ph * 0.11)), font, scale, (255, 255, 255), 1, cv2.LINE_AA)
     ty = y0 + ph - 4
     cv2.putText(img, "0", (x0 + 4, ty), font, scale, (200, 200, 200), 1, cv2.LINE_AA)
     (tw, _), _ = cv2.getTextSize("255", font, scale, 1)
@@ -368,22 +389,45 @@ def proc_labeling(img, st):
 
 
 def proc_labeling2(img, st):
+    # ラベリング＋図形の特徴: 外接矩形、面積 S、重心（×）、モーメントから求めた主軸（楕円と線）
+    # ←/→ で表示する領域の最小面積を変える
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, binimg = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     num, label, stats, centroids = cv2.connectedComponentsWithStats(binimg)
     result = cv2.cvtColor(st.colors_hsv[label % 256], cv2.COLOR_HSV2BGR)
+    min_area = param(st, "labeling2")
     font = cv2.FONT_HERSHEY_PLAIN
-    for i in range(1, num):
+    # 画像の半分を超える大きな領域は背景とみなして除く
+    big = [i for i in range(1, num) if min_area <= stats[i][4] <= label.size // 2]
+    for i in sorted(big, key=lambda i: -stats[i][4])[:30]:        # 大きい順に 30 個まで
         x, y, w, h, area = stats[i]
-        if area < 100:
-            continue
-        x1, y1 = x + w, y + h
-        cv2.rectangle(result, (x, y), (x1, y1), (0, 0, 255))
-        cv2.putText(result, "ID: " + str(i), (x, y1 + 15), font, 1, (0, 255, 255))
-        cv2.putText(result, "S: " + str(area), (x, y1 + 30), font, 1, (0, 255, 255))
-        cv2.putText(result, "X: " + str(int(centroids[i][0])), (x1 - 10, y1 + 15), font, 1, (0, 255, 255))
-        cv2.putText(result, "Y: " + str(int(centroids[i][1])), (x1 - 10, y1 + 30), font, 1, (0, 255, 255))
+        cv2.rectangle(result, (x, y), (x + w, y + h), (0, 0, 255))
+        cx, cy, theta, major, minor = principal_axes(label[y:y + h, x:x + w] == i)
+        cx, cy = cx + x, cy + y
+        cv2.ellipse(result, (int(cx), int(cy)), (int(major), int(minor)), np.degrees(theta), 0, 360,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        dx, dy = major * np.cos(theta), major * np.sin(theta)
+        cv2.line(result, (int(cx - dx), int(cy - dy)), (int(cx + dx), int(cy + dy)), (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.drawMarker(result, (int(cx), int(cy)), (0, 0, 255), cv2.MARKER_CROSS, 10, 2)
+        cv2.putText(result, "S:%d" % area, (x, y + h + 13), font, 1, (0, 255, 255))
+        cv2.putText(result, "deg:%.0f e:%.1f" % (np.degrees(theta), major / max(minor, 1e-6)),
+                    (x, y + h + 26), font, 1, (0, 255, 255))
     return result
+
+
+def principal_axes(mask):
+    """領域（True の画素）のモーメントから、重心・主軸の向き・主軸方向の広がりを求める。
+    中心モーメント μ20, μ02, μ11 から
+      向き θ = 1/2 atan2(2μ11, μ20 - μ02)
+      主軸方向の分散 λ1, λ2 = (μ20 + μ02)/2 ± sqrt(((μ20 - μ02)/2)² + μ11²)  （面積 m00 で割る）
+    戻り値: (重心x, 重心y, θ[rad], 長軸の半径, 短軸の半径)  半径は 2√λ（一様な楕円なら輪郭の大きさ）"""
+    m = cv2.moments(mask.astype(np.uint8), binaryImage=True)
+    m00 = max(m["m00"], 1e-6)
+    mu20, mu02, mu11 = m["mu20"] / m00, m["mu02"] / m00, m["mu11"] / m00
+    theta = 0.5 * np.arctan2(2 * mu11, mu20 - mu02)
+    common = np.sqrt(((mu20 - mu02) / 2) ** 2 + mu11 ** 2)
+    l1, l2 = (mu20 + mu02) / 2 + common, max((mu20 + mu02) / 2 - common, 0)
+    return m["m10"] / m00, m["m01"] / m00, theta, 2 * np.sqrt(l1), 2 * np.sqrt(l2)
 
 
 def proc_facedetect(img, st):
@@ -493,15 +537,16 @@ def proc_dog(img, st):
 
 
 def proc_hist_eq(img, st):
+    # ヒストグラム平坦化: ヒストグラムがなるべく平らになるように濃淡を割り当て直す
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return cv2.equalizeHist(gray)
+    return with_histogram(cv2.equalizeHist(gray), st)
 
 
 def proc_hist_eq_clahe(img, st):
     if st.clahe is None:
         st.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return st.clahe.apply(gray)
+    return with_histogram(st.clahe.apply(gray), st)
 
 
 # ----------------------------------------------------------------------
@@ -545,6 +590,212 @@ def proc_custom(img, st):
 
 
 # ----------------------------------------------------------------------
+# ←/→（または , .）で変える、処理ごとのパラメータ
+#   処理名: (パラメータの名前, 値の候補, 最初の値)   → で候補の次の値（効果が強い・厳しい方）へ
+#   ※ 二値化（b）のしきい値だけは、大津の値を起点に手動にする別の扱い（shift_threshold）
+# ----------------------------------------------------------------------
+PARAMS = {
+    "channels":    ("space", ["RGB", "YIQ", "HSV", "Lab"], "RGB"),
+    "quantize":    ("bits", [8, 7, 6, 5, 4, 3, 2, 1], 3),
+    "sampling":    ("block", [1, 2, 3, 4, 6, 8, 12, 16, 24, 32], 8),
+    "labeling2":   ("min area", [10, 25, 50, 100, 200, 400, 800, 1600, 3200], 100),
+    "houghline":   ("votes", [40, 60, 80, 100, 120, 150, 200, 250, 300], 120),
+    "houghcircle": ("votes", [10, 15, 20, 25, 30, 40, 50, 60, 80], 50),
+    "pedestrian":  ("SVM threshold", [-0.5, 0.0, 0.25, 0.5, 0.75, 1.0, 1.5], 0.0),
+}
+
+
+def param(st, proc):
+    """処理 proc の、いまのパラメータの値"""
+    _, values, default = PARAMS[proc]
+    return values[st.param_index.get(proc, values.index(default))]
+
+
+def shift_param(st, proc, step):
+    _, values, default = PARAMS[proc]
+    i = st.param_index.get(proc, values.index(default))
+    st.param_index[proc] = int(np.clip(i + step, 0, len(values) - 1))
+
+
+def put_outlined(img, text, org, scale, color, thickness=1):
+    """黒いふち付きの文字（どんな背景でも読めるように）"""
+    # ふちは同じ太さの黒い文字を少しずらして重ねて描く（太い黒い文字を下に敷く方法は、
+    # OpenCV 5 では太さで文字の幅が変わるため、文字がずれてしまう）
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for dx, dy in ((-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)):
+        cv2.putText(img, text, (org[0] + dx, org[1] + dy), font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
+    cv2.putText(img, text, org, font, scale, color, thickness, cv2.LINE_AA)
+
+
+def put_info(img, text, row=0):
+    """画像の右上に説明の文字を描く"""
+    scale = max(img.shape[0] / 600.0, 0.4)
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+    put_outlined(img, text, (img.shape[1] - tw - 8, int(8 + th + row * th * 1.6)), scale, (0, 255, 255))
+
+
+def proc_channels(img, st):
+    # 色空間のチャネル表示: 左上に元の画像、残り 3 つに各チャネルをグレースケールで並べる
+    # ←/→ で色空間を切り替える（RGB → YIQ → HSV → L*a*b*）
+    space = param(st, "channels")
+    f = img.astype(np.float32)
+    b, g, r = f[..., 0], f[..., 1], f[..., 2]
+    if space == "RGB":
+        chans = [(r, "R"), (g, "G"), (b, "B")]
+    elif space == "YIQ":
+        y = 0.299 * r + 0.587 * g + 0.114 * b
+        i = 0.596 * r - 0.274 * g - 0.322 * b          # およそ -152〜152
+        q = 0.211 * r - 0.523 * g + 0.312 * b          # およそ -134〜134
+        chans = [(y, "Y"), (128 + i * 127 / 152, "I (gray = 0)"), (128 + q * 127 / 134, "Q (gray = 0)")]
+    elif space == "HSV":
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+        chans = [(hsv[..., 0] * 255 / 179, "H (0-179 -> 0-255)"), (hsv[..., 1], "S"), (hsv[..., 2], "V")]
+    else:
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2Lab).astype(np.float32)   # 8 ビットでは a*, b* は 128 が 0
+        chans = [(lab[..., 0], "L*"), (lab[..., 1], "a* (gray = 0)"), (lab[..., 2], "b* (gray = 0)")]
+    H, W = img.shape[:2]
+    h2, w2 = H // 2, W // 2
+    tiles = [(img, space + "  <-/->")] + [
+        (cv2.cvtColor(np.clip(c, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR), name) for c, name in chans]
+    result = np.zeros_like(img)
+    for k, (tile, name) in enumerate(tiles):
+        y, x = (k // 2) * h2, (k % 2) * w2
+        cell = cv2.resize(tile, (w2, h2), interpolation=cv2.INTER_AREA)
+        put_info(cell, name)
+        result[y:y + h2, x:x + w2] = cell
+    return result
+
+
+def proc_quantize(img, st):
+    # 量子化: 1 チャネルあたりのビット数を減らし、2^bits 段階の値だけで表す（←/→ でビット数）
+    bits = param(st, "quantize")
+    step = 1 << (8 - bits)
+    result = (img // step) * step + step // 2          # 各段階は、その範囲の中央の値で表す
+    put_info(result, "%d bits / channel = %d levels" % (bits, 1 << bits))
+    return result
+
+
+def proc_sampling(img, st):
+    # 標本化: block x block 画素ごとに 1 つの値にまとめ、解像度を下げる（←/→ でブロックの大きさ）
+    k = param(st, "sampling")
+    H, W = img.shape[:2]
+    small = cv2.resize(img, (max(W // k, 1), max(H // k, 1)), interpolation=cv2.INTER_AREA)
+    result = cv2.resize(small, (W, H), interpolation=cv2.INTER_NEAREST)
+    put_info(result, "block %d px -> %d x %d samples" % (k, small.shape[1], small.shape[0]))
+    return result
+
+
+MAX_HOUGH_LINES = 40
+
+
+def hough_accumulator(edges, n_theta=180, n_rho=180, max_points=6000):
+    """直線の Hough 変換の投票空間を自前で計算する（表示用）。
+    エッジ点 (x, y) ごとに、θ を 0〜180° で動かして ρ = x cosθ + y sinθ の位置に 1 票入れる。
+    戻り値: (投票数の表 [ρ, θ], ρ の範囲の半分 = 画像の対角線の長さ)"""
+    ys, xs = np.nonzero(edges)
+    if len(xs) > max_points:                           # 点が多いときは間引く（表示用なので十分）
+        idx = np.linspace(0, len(xs) - 1, max_points).astype(int)
+        xs, ys = xs[idx], ys[idx]
+    diag = float(np.hypot(*edges.shape))
+    thetas = np.arange(n_theta) * np.pi / n_theta
+    rho = xs[:, None] * np.cos(thetas) + ys[:, None] * np.sin(thetas)            # 点の数 x n_theta
+    r_idx = np.round((rho + diag) / (2 * diag) * (n_rho - 1)).astype(int)
+    flat = r_idx * n_theta + np.arange(n_theta)
+    acc = np.bincount(flat.ravel(), minlength=n_rho * n_theta).reshape(n_rho, n_theta)
+    return acc, diag
+
+
+def draw_hough_space(img, acc, diag, lines):
+    """画像の右下に投票空間のヒートマップを描き、検出した直線の (ρ, θ) に丸を付ける"""
+    H, W = img.shape[:2]
+    pw, ph = int(W * 0.42), int(H * 0.42)
+    x0, y0 = W - pw - 8, H - ph - 8
+    heat = np.log1p(acc.astype(np.float32))
+    heat = (heat / max(heat.max(), 1e-6) * 255).astype(np.uint8)
+    heat = cv2.applyColorMap(cv2.resize(heat, (pw, ph), interpolation=cv2.INTER_LINEAR), cv2.COLORMAP_INFERNO)
+    for rho, theta in lines:
+        px = int(theta / np.pi * (pw - 1))
+        py = int((rho + diag) / (2 * diag) * (ph - 1))
+        cv2.circle(heat, (px, py), 6, (0, 255, 0), 1, cv2.LINE_AA)
+    img[y0:y0 + ph, x0:x0 + pw] = heat
+    cv2.rectangle(img, (x0, y0), (x0 + pw, y0 + ph), (255, 255, 255), 1)
+    font, scale = cv2.FONT_HERSHEY_SIMPLEX, max(ph / 320.0, 0.35)
+    for text, org in (("Hough space (votes)", (x0 + 5, y0 + 16)),
+                      ("theta 0 -> 180 deg", (x0 + 5, y0 + ph - 6)),
+                      ("rho", (x0 + pw - 34, y0 + 16))):
+        put_outlined(img, text, org, scale, (255, 255, 255))
+
+
+def proc_houghline(img, st):
+    # Hough 変換による直線検出: エッジ（Canny）の点が投票し、票の多い (ρ, θ) を直線とする
+    # 右下に投票空間のヒートマップ（緑の丸が検出した直線）。←/→ で直線とみなす票数のしきい値
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    votes = param(st, "houghline")
+    found = cv2.HoughLines(edges, 1, np.pi / 180, votes)
+    lines = [] if found is None else [tuple(l) for l in found[:MAX_HOUGH_LINES, 0]]
+    result = cv2.addWeighted(img, 0.5, cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR), 0.5, 0)
+    L = int(np.hypot(*img.shape[:2]))
+    for rho, theta in lines:
+        a, b = np.cos(theta), np.sin(theta)
+        x, y = a * rho, b * rho
+        cv2.line(result, (int(x - L * b), int(y + L * a)), (int(x + L * b), int(y - L * a)),
+                 (0, 0, 255), 2, cv2.LINE_AA)
+    acc, diag = hough_accumulator(edges)
+    draw_hough_space(result, acc, diag, lines)
+    put_info(result, "%d lines (votes >= %d)" % (len(lines), votes))
+    return result
+
+
+def proc_houghcircle(img, st):
+    # Hough 変換による円検出（勾配を使う方法）。←/→ で円の中心とみなす票数のしきい値
+    gray = cv2.medianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 5)
+    H = gray.shape[0]
+    votes = param(st, "houghcircle")
+    found = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1.5, minDist=H / 12, param1=120,
+                             param2=votes, minRadius=max(H // 40, 5), maxRadius=H // 3)
+    circles = [] if found is None else np.round(found[0]).astype(int)
+    result = img.copy()
+    for x, y, r in circles:
+        cv2.circle(result, (x, y), r, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.drawMarker(result, (x, y), (0, 0, 255), cv2.MARKER_CROSS, 8, 2)
+    put_info(result, "%d circles (votes >= %d)" % (len(circles), votes))
+    return result
+
+
+def load_hog(st):
+    """HOG 特徴 + 学習済みの線形 SVM（歩行者検出器）を用意する。使えなければ False"""
+    if st.hog is None:
+        if not hasattr(cv2, "HOGDescriptor"):
+            print("この OpenCV (%s) には HOGDescriptor がありません（opencv-contrib-python が必要）。" % cv2.__version__)
+            st.hog = False
+        else:
+            st.hog = cv2.HOGDescriptor()
+            st.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    return st.hog is not False
+
+
+def proc_pedestrian(img, st):
+    # HOG 特徴 + 線形 SVM による人物（歩行者）検出。64x128 画素の窓を動かしながら、
+    # 窓内の HOG 特徴を SVM で「人／人でない」に分類する（全身が映っている必要がある）
+    # ←/→ で SVM の判定のしきい値（大きいほど厳しい）
+    if not load_hog(st):
+        return show_unavailable(img, "HOG + SVM not available")
+    s = min(1.0, 640.0 / img.shape[1])                  # 速さのため幅 640 画素以下にして検出
+    small = cv2.resize(img, None, fx=s, fy=s) if s < 1.0 else img
+    thr = param(st, "pedestrian")
+    rects, weights = st.hog.detectMultiScale(small, hitThreshold=thr, winStride=(8, 8),
+                                             padding=(8, 8), scale=1.05)
+    result = img.copy()
+    for (x, y, w, h), wt in zip(rects, np.ravel(weights) if len(rects) else []):
+        x, y, w, h = [int(v / s) for v in (x, y, w, h)]
+        cv2.rectangle(result, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.putText(result, "%.2f" % wt, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    put_info(result, "%d persons (SVM threshold %.2f)" % (len(rects), thr))
+    return result
+
+
+# ----------------------------------------------------------------------
 # キーと処理の対応表   キー: (処理名, 関数, 説明)
 # ----------------------------------------------------------------------
 PROCS = {
@@ -557,13 +808,19 @@ PROCS = {
     'h': ("hue",           proc_hue,           "色相のみ表示"),
     'S': ("saturation",    proc_saturation,    "彩度のみ表示（HSV の S）"),
     'V': ("value",         proc_value,         "明度のみ表示（HSV の V）"),
+    'v': ("channels",      proc_channels,      "色空間のチャネル（RGB・YIQ・HSV・Lab）"),
+    'Q': ("quantize",      proc_quantize,      "量子化（ビット数）"),
+    'Z': ("sampling",      proc_sampling,      "標本化（ブロックの大きさ）"),
+    'H': ("houghline",     proc_houghline,     "Hough 変換: 直線と投票空間"),
+    'O': ("houghcircle",   proc_houghcircle,   "Hough 変換: 円"),
+    'P': ("pedestrian",    proc_pedestrian,    "人物検出（HOG + SVM）"),
     'b': ("binary",        proc_binary,        "二値化（大津の方法）"),
     ':': ("sift",          proc_sift,          "SIFT 特徴点"),
     'f': ("denseflow",     proc_denseflow,     "密なオプティカルフロー（Farneback）"),
     'l': ("labeling",      proc_labeling,      "ラベリング"),
-    ';': ("labeling2",     proc_labeling2,     "ラベリング＋外接矩形・重心"),
+    ';': ("labeling2",     proc_labeling2,     "ラベリング＋面積・重心・主軸"),
     't': ("lktracking",    proc_lktracking,    "特徴点追跡（Lucas-Kanade）"),
-    'F': ("facedetect",    proc_facedetect,    "顔検出（Haar-like 特徴・Viola-Jones 法）"),
+    'F': ("facedetect",    proc_facedetect,    "顔検出（Haar-like 特徴）"),
     'Y': ("yunet",         proc_yunet,         "顔検出（YuNet・CNN）"),
     'K': ("pose",          proc_pose,          "人体の骨格推定（MediaPipe Pose）"),
     'U': ("bodydetect",    proc_bodydetect,    "上半身検出（Haar-like）"),
@@ -573,6 +830,18 @@ PROCS = {
     'u': ("custom",        proc_custom,        "自作の処理（proc_custom を編集）"),
 }
 PROC_FUNCS = {name: func for (name, func, _) in PROCS.values()}
+
+# ヘルプでの処理の分類: (見出し, 英語の見出し, キー)
+PROC_GROUPS = [
+    ("色・濃淡", "Color & intensity", "cgvhSVQZ"),
+    ("ヒストグラム・領域", "Histogram & regions", "beEl;"),
+    ("特徴・フィルタ", "Features & filters", "xysad:HO"),
+    ("検出", "Detection", "FYUPK"),
+    ("動き", "Motion", "ft"),
+    ("自作", "Your own", "u"),
+]
+assert sorted("".join(g for _, _, g in PROC_GROUPS)) == sorted(PROCS), "PROC_GROUPS と PROCS が合っていない"
+NEAREST_PROCS = {"quantize", "sampling"}     # 表示の拡大で画素の境目をぼかさない処理
 
 BLURS = {
     'G': ("gaussian",  "前処理: ガウシアンぼかし"),
@@ -584,13 +853,22 @@ BLURS = {
 def print_help():
     print("-" * 60)
     print("キー操作（画像ウィンドウを選択した状態で押してください）")
-    for k, (_, _, desc) in PROCS.items():
-        print("  %s : %s" % (k, desc))
+    for title, _, keys in PROC_GROUPS:
+        print("【%s】" % title)
+        for k in keys:
+            name = PROCS[k][0]
+            extra = ("  （←/→: %s）" % PARAMS[name][0]) if name in PARAMS else (
+                "  （←/→: しきい値を手動に）" if name == "binary" else "")
+            print("  %s : %s%s" % (k, PROCS[k][2], extra))
+    print("【前処理（ぼかし）】")
     for k, (_, desc) in BLURS.items():
         print("  %s : %s" % (k, desc))
     print("  ↑ / + : ぼかしを強く        ↓ / - : ぼかしを弱く")
-    print("  ← / , : 二値化のしきい値を下げる  → / . : 上げる（b の実行中。押すと手動になり値が固定される）")
-    print("  ESC   : ぼかしをリセット・二値化のしきい値を自動（大津）に戻す")
+    print("【その他】")
+    print("  ← / , → / . : 今の処理のパラメータを変える（v Q Z ; H O P）")
+    print("                b ではしきい値を下げる・上げる（押すと手動になり値が固定される）")
+    print("  ESC   : ぼかしと今の処理のパラメータを元に戻す（b はしきい値を自動（大津）に）")
+    print("  i     : ヒストグラム表示の ON/OFF（g b e E）")
     print("  p     : 顔検出中に横顔検出の ON/OFF")
     print("  k     : 骨格推定中に平滑化の ON/OFF")
     print("  n     : NDI 送信の ON/OFF（ndi-python が必要・任意）")
@@ -609,11 +887,15 @@ HELP_EN = {   # OpenCV 4 用の英語の説明（ない処理は処理名をそ�
     "sobelx": "Sobel filter (x)", "sobely": "Sobel filter (y)",
     "sobel": "Gradient magnitude", "angle": "Gradient direction (hue) & magnitude",
     "hue": "Hue only", "saturation": "Saturation only (S of HSV)", "value": "Value only (V of HSV)",
+    "channels": "Color channels (RGB YIQ HSV Lab)", "quantize": "Quantization (bits)",
+    "sampling": "Sampling (block size)",
+    "houghline": "Hough transform: lines & vote space", "houghcircle": "Hough transform: circles",
+    "pedestrian": "Person detection (HOG + SVM)",
     "binary": "Binarize (Otsu)", "sift": "SIFT keypoints",
     "denseflow": "Dense optical flow (Farneback)", "labeling": "Labeling",
-    "labeling2": "Labeling + bounding box & centroid",
+    "labeling2": "Labeling + area, centroid, principal axis",
     "lktracking": "Feature tracking (Lucas-Kanade)",
-    "facedetect": "Face detection (Haar-like, Viola-Jones)",
+    "facedetect": "Face detection (Haar-like)",
     "yunet": "Face detection (YuNet, CNN)", "bodydetect": "Upper body detection (Haar-like)",
     "pose": "Human pose estimation (MediaPipe Pose)",
     "dog": "DoG filter", "hist_eq": "Histogram equalization",
@@ -658,52 +940,64 @@ class TextDrawer:
 
 
 def help_columns(st, ja):
-    """ヘルプの内容を (キー, 説明, 色) のリスト2列分として返す"""
+    """ヘルプの内容を (キー, 説明, 色) のリストの列（3 列）として返す"""
     def desc_of(name, desc):
         return desc if ja else HELP_EN.get(name, name)
 
-    col1 = [("", "処理の切り替え" if ja else "Processing", COLOR_HEAD)]
-    for k, (name, _, desc) in PROCS.items():
-        col1.append((k, desc_of(name, desc), COLOR_CURRENT if name == st.proc else COLOR_ITEM))
+    def group(i):
+        title, title_en, keys = PROC_GROUPS[i]
+        rows = [("", title if ja else title_en, COLOR_HEAD)]
+        for k in keys:
+            name, _, desc = PROCS[k]
+            mark = (" ←→" if ja else " <->") if (name in PARAMS or name == "binary") else ""
+            rows.append((k, desc_of(name, desc) + mark, COLOR_CURRENT if name == st.proc else COLOR_ITEM))
+        return rows
 
-    col2 = [("", "前処理（ぼかし）" if ja else "Pre-filter (blur)", COLOR_HEAD)]
+    blank = [("", "", COLOR_ITEM)]
+    col1 = group(0) + blank + group(1)
+    col2 = group(2) + blank + group(3) + blank + group(4) + blank + group(5)
+
+    col3 = [("", "前処理（ぼかし）" if ja else "Pre-filter (blur)", COLOR_HEAD)]
     for k, (name, desc) in BLURS.items():
         desc = desc.replace("前処理: ", "")
-        col2.append((k, desc_of(name, desc), COLOR_CURRENT if name == st.blur_proc else COLOR_ITEM))
-    param = {"gaussian": "k=%d" % st.gaussian_scale,
-             "median": "k=%d" % st.median_scale,
-             "bilateral": "d=%d" % st.bilateral_scale}.get(st.blur_proc, "")
+        col3.append((k, desc_of(name, desc), COLOR_CURRENT if name == st.blur_proc else COLOR_ITEM))
+    blur_param = {"gaussian": "k=%d" % st.gaussian_scale,
+                  "median": "k=%d" % st.median_scale,
+                  "bilateral": "d=%d" % st.bilateral_scale}.get(st.blur_proc, "")
     profile = "ON" if st.profile_face else "OFF"
     smooth = "OFF" if (st.pose and not st.pose.smoothing) else "ON"
+    hist = "ON" if st.show_hist else "OFF"
     if ja:
-        col2 += [("↑ / +", "ぼかしを強く", COLOR_ITEM),
+        col3 += [("↑ / +", "ぼかしを強く", COLOR_ITEM),
                  ("↓ / -", "ぼかしを弱く", COLOR_ITEM),
-                 ("ESC", "ぼかしをリセット・しきい値を自動に", COLOR_ITEM),
-                 ("", "（現在: %s  %s）" % (st.blur_proc, param), COLOR_CURRENT),
+                 ("", "（現在: %s  %s）" % (st.blur_proc, blur_param), COLOR_CURRENT),
                  ("", "", COLOR_ITEM),
                  ("", "その他", COLOR_HEAD),
-                 ("← / ,", "しきい値を下げる（b の実行中、手動に切替）", COLOR_ITEM),
-                 ("→ / .", "しきい値を上げる（b の実行中、手動に切替）", COLOR_ITEM),
-                 ("p", "横顔検出 %s（顔検出 F の実行中）" % profile, COLOR_ITEM),
-                 ("k", "骨格の平滑化 %s（骨格推定 K の実行中）" % smooth, COLOR_ITEM),
+                 ("← →", "←→ の付いた処理のパラメータ", COLOR_ITEM),
+                 ("", "を変える（, . でも可）", COLOR_ITEM),
+                 ("ESC", "ぼかし・パラメータを元に戻す", COLOR_ITEM),
+                 ("i", "ヒストグラム %s（g b e E）" % hist, COLOR_ITEM),
+                 ("p", "横顔検出 %s（F の実行中）" % profile, COLOR_ITEM),
+                 ("k", "骨格の平滑化 %s（K の実行中）" % smooth, COLOR_ITEM),
                  ("n", "NDI 送信 ON/OFF（任意機能）", COLOR_ITEM),
                  ("?", "このヘルプを閉じる / 開く", COLOR_ITEM),
                  ("q", "終了", COLOR_ITEM)]
     else:
-        col2 += [("Up / +", "stronger blur", COLOR_ITEM),
+        col3 += [("Up / +", "stronger blur", COLOR_ITEM),
                  ("Down / -", "weaker blur", COLOR_ITEM),
-                 ("ESC", "reset blur, threshold to auto", COLOR_ITEM),
-                 ("", "(now: %s  %s)" % (st.blur_proc, param), COLOR_CURRENT),
+                 ("", "(now: %s  %s)" % (st.blur_proc, blur_param), COLOR_CURRENT),
                  ("", "", COLOR_ITEM),
                  ("", "Others", COLOR_HEAD),
-                 ("Left / ,", "lower threshold (during b, manual)", COLOR_ITEM),
-                 ("Right / .", "raise threshold (during b, manual)", COLOR_ITEM),
+                 ("<- ->", "change parameter of <-> items", COLOR_ITEM),
+                 ("", "(also , .)", COLOR_ITEM),
+                 ("ESC", "reset blur & parameter", COLOR_ITEM),
+                 ("i", "histogram %s (g b e E)" % hist, COLOR_ITEM),
                  ("p", "profile face %s (during F)" % profile, COLOR_ITEM),
                  ("k", "pose smoothing %s (during K)" % smooth, COLOR_ITEM),
                  ("n", "NDI output ON/OFF (optional)", COLOR_ITEM),
                  ("?", "close / open this help", COLOR_ITEM),
                  ("q", "quit", COLOR_ITEM)]
-    return col1, col2
+    return [col1, col2, col3]
 
 
 def status_px(H):
@@ -716,8 +1010,8 @@ def render_help_layer(W, H, st, drawer):
     ja = drawer.japanese
     title = ("キー操作（ウィンドウを選択した状態で押す）" if ja
              else "Key operations (click the window first)")
-    col1, col2 = help_columns(st, ja)
-    rows = max(len(col1), len(col2)) + 2          # +2 はタイトルと空行の分
+    cols = help_columns(st, ja)
+    rows = max(len(c) for c in cols) + 2          # +2 はタイトルと空行の分
 
     def col_size(col, px):
         """(キー欄の幅, 列全体の幅) を返す。見出しはキー欄を使わない"""
@@ -729,21 +1023,21 @@ def render_help_layer(W, H, st, drawer):
     # 横にはみ出す場合はさらに縮める
     top = status_px(H) * 1.8
     area_h = H - top - H * 0.03
-    px = min(max(area_h / rows / 1.45, 10), 40)
-    for _ in range(3):
-        (kw1, w1), (kw2, w2) = col_size(col1, px), col_size(col2, px)
-        gap = px * 2.5
-        total_w = max(w1 + gap + w2, drawer.width(title, px * 1.1))
-        if total_w <= W * 0.92:
+    px = min(max(area_h / rows / 1.45, 9), 40)
+    for _ in range(4):
+        sizes = [col_size(c, px) for c in cols]
+        gap = px * 2.0
+        total_w = max(sum(w for _, w in sizes) + gap * (len(cols) - 1), drawer.width(title, px * 1.1))
+        if total_w <= W * 0.94:
             break
-        px *= W * 0.92 / total_w
+        px *= W * 0.94 / total_w
     line_h = px * 1.45
 
     layer = np.zeros((H, W, 3), np.uint8)
-    x0 = (W - total_w) / 2
+    x = (W - total_w) / 2
     y0 = top + (area_h - rows * line_h) / 2 + px
-    drawer.put(layer, title, (x0, y0), COLOR_ITEM, px * 1.1, bold=True)
-    for col, x, kw in ((col1, x0, kw1), (col2, x0 + w1 + gap, kw2)):
+    drawer.put(layer, title, (x, y0), COLOR_ITEM, px * 1.1, bold=True)
+    for col, (kw, w) in zip(cols, sizes):
         y = y0 + line_h * 2
         for k, text, color in col:
             bold = (color == COLOR_HEAD)
@@ -753,6 +1047,7 @@ def render_help_layer(W, H, st, drawer):
             elif text:
                 drawer.put(layer, text, (x, y), color, px, bold)
             y += line_h
+        x += w + gap
     return layer
 
 
@@ -760,7 +1055,7 @@ def draw_help(img, st, drawer, cache):
     """画像を暗くしてヘルプを重ねる（文字の画像は内容が変わったときだけ作り直す）"""
     H, W = img.shape[:2]
     key = (W, H, st.proc, st.blur_proc, st.gaussian_scale, st.median_scale,
-           st.bilateral_scale, st.profile_face, bool(st.pose and st.pose.smoothing))
+           st.bilateral_scale, st.profile_face, bool(st.pose and st.pose.smoothing), st.show_hist)
     if cache.get("key") != key:
         cache["key"] = key
         cache["layer"] = render_help_layer(W, H, st, drawer)
@@ -902,13 +1197,18 @@ def main():
             st.increase_param()
         elif key == "DOWN" or key == '-':
             st.decrease_param()
-        elif key in ("LEFT", ',') and st.proc == "binary":
-            shift_threshold(st, -BIN_STEP)
-        elif key in ("RIGHT", '.') and st.proc == "binary":
-            shift_threshold(st, BIN_STEP)
-        elif key == chr(27):          # ESC
+        elif key in ("LEFT", ',', "RIGHT", '.'):     # 今の処理のパラメータを変える
+            step = 1 if key in ("RIGHT", '.') else -1
+            if st.proc == "binary":
+                shift_threshold(st, step * BIN_STEP)
+            elif st.proc in PARAMS:
+                shift_param(st, st.proc, step)
+        elif key == chr(27):          # ESC: ぼかしと今の処理のパラメータを元に戻す
             st.reset_param()
             st.bin_manual = None
+            st.param_index.pop(st.proc, None)
+        elif key == 'i':
+            st.show_hist = not st.show_hist
         elif key == '?':
             show_help = not show_help
             if show_help:
@@ -949,12 +1249,15 @@ def main():
         # 表示
         if result.ndim == 2:
             result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
-        result = cv2.resize(result, (width, height))
+        interp = cv2.INTER_NEAREST if st.proc in NEAREST_PROCS else cv2.INTER_LINEAR
+        result = cv2.resize(result, (width, height), interpolation=interp)
         if show_help:
             result = draw_help(result, st, drawer, help_cache)
         px = status_px(height)
-        drawer.put(result, "FPS:%.1f  proc:%s  blur:%s" % (1.0 / duration, st.proc, st.blur_proc),
-                   (px * 0.5, px * 1.3), (0, 255, 0), px, bold=True)
+        status = "FPS:%.1f  proc:%s  blur:%s" % (1.0 / duration, st.proc, st.blur_proc)
+        if st.proc in PARAMS:
+            status += "  %s:%s" % (PARAMS[st.proc][0], param(st, st.proc))
+        drawer.put(result, status, (px * 0.5, px * 1.3), (0, 255, 0), px, bold=True)
         if not show_help:
             drawer.put(result, "?: ヘルプ" if drawer.japanese else "?: help",
                        (px * 0.5, height - px * 0.6), (0, 255, 0), px * 0.8)

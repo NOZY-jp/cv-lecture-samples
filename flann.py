@@ -237,7 +237,11 @@ def draw_error_legend(img, threshold, x, y, width=200):
 
 def put_label(img, text, org, color, scale=0.7):
     """黒いふち付きの文字（どんな背景でも読めるように）"""
-    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 4, cv2.LINE_AA)
+    # ふちは同じ太さの黒い文字を少しずらして重ねて描く（太い黒い文字を下に敷く方法は、
+    # OpenCV 5 では太さで文字の幅が変わるため、文字がずれてしまう）
+    for dx, dy in ((-2, 0), (2, 0), (0, -2), (0, 2), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+        cv2.putText(img, text, (org[0] + dx, org[1] + dy), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 2,
+                    cv2.LINE_AA)
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
 
 
