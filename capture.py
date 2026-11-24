@@ -699,47 +699,58 @@ def proc_sampling(img, st):
 MAX_HOUGH_LINES = 40
 
 
-def hough_accumulator(edges, n_theta=180, n_rho=180, max_points=6000):
-    """直線の Hough 変換の投票空間を自前で計算する（表示用）。
-    エッジ点 (x, y) ごとに、θ を 0〜180° で動かして ρ = x cosθ + y sinθ の位置に 1 票入れる。
-    戻り値: (投票数の表 [ρ, θ], ρ の範囲の半分 = 画像の対角線の長さ)"""
+def hough_accumulator(edges, max_points=15000):
+    """直線の Hough 変換の投票空間を、cv2.HoughLines（ρ: 1 画素, θ: 1° 刻み）と同じ細かさで計算する。
+    エッジ点 (x, y) ごとに、θ を 0〜179° で動かして ρ = x cosθ + y sinθ の位置に 1 票入れる。
+    エッジ点が多いときは max_points 個に間引き、その分だけ票数を補正する（検出の票数と比べられるように）。
+    戻り値: (投票数の表 [ρ + 対角線の長さ, θ], 対角線の長さ)"""
     ys, xs = np.nonzero(edges)
-    if len(xs) > max_points:                           # 点が多いときは間引く（表示用なので十分）
+    ratio = 1.0
+    if len(xs) > max_points:
+        ratio = len(xs) / max_points
         idx = np.linspace(0, len(xs) - 1, max_points).astype(int)
         xs, ys = xs[idx], ys[idx]
-    diag = float(np.hypot(*edges.shape))
-    thetas = np.arange(n_theta) * np.pi / n_theta
-    rho = xs[:, None] * np.cos(thetas) + ys[:, None] * np.sin(thetas)            # 点の数 x n_theta
-    r_idx = np.round((rho + diag) / (2 * diag) * (n_rho - 1)).astype(int)
-    flat = r_idx * n_theta + np.arange(n_theta)
-    acc = np.bincount(flat.ravel(), minlength=n_rho * n_theta).reshape(n_rho, n_theta)
-    return acc, diag
+    diag = int(np.ceil(np.hypot(*edges.shape)))
+    thetas = np.deg2rad(np.arange(180))
+    rho = np.round(xs[:, None] * np.cos(thetas) + ys[:, None] * np.sin(thetas)).astype(np.int64) + diag
+    acc = np.bincount((rho * 180 + np.arange(180)).ravel(), minlength=(2 * diag + 1) * 180)
+    return acc.reshape(2 * diag + 1, 180) * ratio, diag
 
 
-def draw_hough_space(img, acc, diag, lines):
-    """画像の右下に投票空間のヒートマップを描き、検出した直線の (ρ, θ) に丸を付ける"""
+def draw_hough_space(img, acc, diag, lines, votes):
+    """画像の右下に投票空間のヒートマップを描く。
+    水色の線: 票数がしきい値（votes）以上の範囲。この中の山が直線として検出される
+    緑の点: 検出した直線の (ρ, θ)"""
     H, W = img.shape[:2]
     pw, ph = int(W * 0.42), int(H * 0.42)
     x0, y0 = W - pw - 8, H - ph - 8
-    heat = np.log1p(acc.astype(np.float32))
+    # ρ 方向を表示の高さまで縮める。平均ではなく最大値をとって、細い山が消えないようにする
+    f = int(np.ceil(acc.shape[0] / ph))
+    pooled = np.pad(acc, ((0, (-acc.shape[0]) % f), (0, 0))).reshape(-1, f, acc.shape[1]).max(axis=1)
+    heat = np.log1p(pooled.astype(np.float32))
     heat = (heat / max(heat.max(), 1e-6) * 255).astype(np.uint8)
     heat = cv2.applyColorMap(cv2.resize(heat, (pw, ph), interpolation=cv2.INTER_LINEAR), cv2.COLORMAP_INFERNO)
+    above = cv2.resize((pooled >= votes).astype(np.uint8) * 255, (pw, ph), interpolation=cv2.INTER_NEAREST)
+    above = cv2.dilate(above, np.ones((3, 3), np.uint8), iterations=2)    # 1〜2 セルの鋭い山も見えるよう太らせる
+    contours, _ = cv2.findContours(above, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(heat, contours, -1, (255, 255, 0), 1, cv2.LINE_AA)
     for rho, theta in lines:
         px = int(theta / np.pi * (pw - 1))
         py = int((rho + diag) / (2 * diag) * (ph - 1))
-        cv2.circle(heat, (px, py), 6, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.circle(heat, (px, py), 3, (0, 255, 0), -1, cv2.LINE_AA)
     img[y0:y0 + ph, x0:x0 + pw] = heat
     cv2.rectangle(img, (x0, y0), (x0 + pw, y0 + ph), (255, 255, 255), 1)
     font, scale = cv2.FONT_HERSHEY_SIMPLEX, max(ph / 320.0, 0.35)
-    for text, org in (("Hough space (votes)", (x0 + 5, y0 + 16)),
-                      ("theta 0 -> 180 deg", (x0 + 5, y0 + ph - 6)),
-                      ("rho", (x0 + pw - 34, y0 + 16))):
-        put_outlined(img, text, org, scale, (255, 255, 255))
+    put_outlined(img, "Hough space (votes)", (x0 + 5, y0 + 16), scale, (255, 255, 255))
+    put_outlined(img, "rho", (x0 + pw - 34, y0 + 16), scale, (255, 255, 255))
+    put_outlined(img, "cyan: votes >= %d" % votes, (x0 + 5, y0 + 34), scale, (255, 255, 0))
+    put_outlined(img, "theta 0 -> 180 deg", (x0 + 5, y0 + ph - 6), scale, (255, 255, 255))
 
 
 def proc_houghline(img, st):
     # Hough 変換による直線検出: エッジ（Canny）の点が投票し、票の多い (ρ, θ) を直線とする
-    # 右下に投票空間のヒートマップ（緑の丸が検出した直線）。←/→ で直線とみなす票数のしきい値
+    # 右下に投票空間のヒートマップ（水色の線の内側が票数のしきい値以上、緑の点が検出した直線）。
+    # ←/→ で直線とみなす票数のしきい値を変えると、水色の範囲と検出される直線が変わる
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     votes = param(st, "houghline")
@@ -754,7 +765,7 @@ def proc_houghline(img, st):
         cv2.line(result, (int(x - L * b), int(y + L * a)), (int(x + L * b), int(y - L * a)),
                  (0, 0, 255), 2, cv2.LINE_AA)
     acc, diag = hough_accumulator(edges)
-    draw_hough_space(result, acc, diag, lines)
+    draw_hough_space(result, acc, diag, lines, votes)
     put_info(result, "%d lines (votes >= %d)" % (len(lines), votes))
     return result
 
