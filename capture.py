@@ -95,6 +95,7 @@ class State:
         self.param_index = {}
         self.show_hist = True
         self.hog = None           # HOG 特徴 + SVM の人物検出器
+        self.hough_soft = False   # Hough 変換の投票: False = 1 つのセルに 1 票、True = ぼかし投票（w キー）
 
         # 二値化のしきい値: None なら大津の方法で毎フレーム自動、数値なら ←/→ で決めた手動の値
         self.bin_manual = None
@@ -599,8 +600,8 @@ PARAMS = {
     "quantize":    ("bits", [8, 7, 6, 5, 4, 3, 2, 1], 3),
     "sampling":    ("block", [1, 2, 3, 4, 6, 8, 12, 16, 24, 32], 8),
     "labeling2":   ("min area", [10, 25, 50, 100, 200, 400, 800, 1600, 3200], 100),
-    "houghline":   ("votes", [40, 60, 80, 100, 120, 150, 200, 250, 300], 120),
-    "houghcircle": ("votes", [10, 15, 20, 25, 30, 40, 50, 60, 80], 50),
+    "houghline":   ("votes", [40, 60, 80, 100, 120, 150, 200, 250, 300, 400, 500, 700, 1000], 200),
+    "houghcircle": ("votes", [20, 30, 40, 50, 60, 80, 100, 120, 150, 200, 300, 400, 600], 100),
     "pedestrian":  ("SVM threshold", [-0.5, 0.0, 0.25, 0.5, 0.75, 1.0, 1.5], 0.0),
 }
 
@@ -686,9 +687,43 @@ def proc_sampling(img, st):
 
 
 MAX_HOUGH_LINES = 40
+HOUGH_SOFT_SIGMA = 0.7        # ぼかし投票で、周りのセルに票を広げる範囲（セル単位の標準偏差）
+HOUGH_LINE_NMS = 10           # 直線の検出で、同じ山とみなす距離（セル。ρ 1 画素・θ 1° が 1 セル）
 
 
-def hough_accumulator(edges, max_points=15000):
+def soft_votes(acc):
+    """ぼかし投票: 1 票を、計算結果のセルを中心に、周りのセルにも距離に応じて少しずつ分けて入れる
+    （重みはガウス関数、合計 1 票）。1 つのセルに 1 票ずつ入れた投票空間をガウス関数でぼかすのと同じ結果になる。
+    合計が 1 票なので、票数の大きさは 1 セルに投票した場合とほぼ同じで、同じしきい値で比べられる"""
+    k = cv2.getGaussianKernel(5, HOUGH_SOFT_SIGMA).astype(np.float32)     # 合計 1 に正規化済み
+    return cv2.sepFilter2D(acc.astype(np.float32), -1, k, k, borderType=cv2.BORDER_CONSTANT)
+
+
+def find_peaks(acc, threshold, min_dist, max_n):
+    """投票空間から山を選ぶ（直線・円で共通）:
+    1. 周り 3x3 のセルの中で票数が最大のセルだけを残す（非極大値の抑制）
+    2. 票数がしきい値以上のものを、票の多い順に選ぶ
+    3. すでに選んだ山から min_dist セル以内のものは、同じ山の一部とみなして除く
+    戻り値: [(行, 列, 票数), ...]"""
+    acc = acc.astype(np.float32)
+    local_max = acc >= cv2.dilate(acc, np.ones((3, 3), np.uint8))
+    rows, cols = np.nonzero(local_max & (acc >= threshold))
+    order = np.argsort(-acc[rows, cols])[:3000]          # 候補が多すぎるときは票の多いものから
+    peaks = []
+    for i in order:
+        r, c = int(rows[i]), int(cols[i])
+        if all((r - pr) ** 2 + (c - pc) ** 2 > min_dist ** 2 for pr, pc, _ in peaks):
+            peaks.append((r, c, float(acc[r, c])))
+            if len(peaks) >= max_n:
+                break
+    return peaks
+
+
+def voting_label(st):
+    return "voting: soft (w: single cell)" if st.hough_soft else "voting: single cell (w: soft)"
+
+
+def hough_accumulator(edges, max_points=30000):
     """直線の Hough 変換の投票空間を、cv2.HoughLines（ρ: 1 画素, θ: 1° 刻み）と同じ細かさで計算する。
     エッジ点 (x, y) ごとに、θ を 0〜179° で動かして ρ = x cosθ + y sinθ の位置に 1 票入れる。
     エッジ点が多いときは max_points 個に間引き、その分だけ票数を補正する（検出の票数と比べられるように）。
@@ -731,20 +766,22 @@ def draw_hough_space(img, acc, diag, lines, votes):
     cv2.rectangle(img, (x0, y0), (x0 + pw, y0 + ph), (255, 255, 255), 1)
     font, scale = cv2.FONT_HERSHEY_SIMPLEX, max(ph / 320.0, 0.35)
     put_outlined(img, "Hough space (votes)", (x0 + 5, y0 + 16), scale, (255, 255, 255))
-    put_outlined(img, "rho", (x0 + pw - 34, y0 + 16), scale, (255, 255, 255))
+    put_outlined(img, "rho", (x0 + pw - 34, y0 + ph // 2), scale, (255, 255, 255))
     put_outlined(img, "cyan: votes >= %d" % votes, (x0 + 5, y0 + 34), scale, (255, 255, 0))
     put_outlined(img, "theta 0 -> 180 deg", (x0 + 5, y0 + ph - 6), scale, (255, 255, 255))
 
 
 def proc_houghline(img, st):
-    # Hough 変換による直線検出: エッジ（Canny）の点が投票し、票の多い (ρ, θ) を直線とする
-    # 右下に投票空間のヒートマップ（水色の線の内側が票数のしきい値以上、緑の点が検出した直線）。
-    # ←/→ で直線とみなす票数のしきい値を変えると、水色の範囲と検出される直線が変わる
+    # Hough 変換による直線検出: エッジ（Canny）の点が、通りうるすべての直線 (ρ, θ) に投票し、
+    # 票の多い (ρ, θ) を直線とする。右下に投票空間のヒートマップ（水色の線の内側が票数のしきい値以上、
+    # 緑の点が検出した直線）。←/→ で直線とみなす票数のしきい値、w で投票の仕方（1 セル / ぼかし投票）
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     votes = param(st, "houghline")
-    found = cv2.HoughLines(edges, 1, np.pi / 180, votes)
-    lines = [] if found is None else [tuple(l) for l in found[:MAX_HOUGH_LINES, 0]]
+    acc, diag = hough_accumulator(edges)
+    space = soft_votes(acc) if st.hough_soft else acc
+    peaks = find_peaks(space, votes, min_dist=HOUGH_LINE_NMS, max_n=MAX_HOUGH_LINES)
+    lines = [(r - diag, np.deg2rad(c)) for r, c, _ in peaks]          # 行 → ρ、列 → θ（度）
     result = cv2.addWeighted(img, 0.5, cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR), 0.5, 0)
     L = int(np.hypot(*img.shape[:2]))
     for rho, theta in lines:
@@ -752,9 +789,9 @@ def proc_houghline(img, st):
         x, y = a * rho, b * rho
         cv2.line(result, (int(x - L * b), int(y + L * a)), (int(x + L * b), int(y - L * a)),
                  (0, 0, 255), 2, cv2.LINE_AA)
-    acc, diag = hough_accumulator(edges)
-    draw_hough_space(result, acc, diag, lines, votes)
+    draw_hough_space(result, space, diag, lines, votes)
     put_info(result, "%d lines (votes >= %d)" % (len(lines), votes))
+    put_info(result, voting_label(st), row=1)
     return result
 
 
@@ -798,17 +835,36 @@ def hough_circle_centers(gray, min_r, max_r, max_points=8000):
     return acc.reshape(arows, acols) * ratio, edges
 
 
+HOUGH_CIRCLE_MIN_SUPPORT = 0.25   # 円周のうち、この割合以上にエッジ点がある円だけを残す
+
+
+def estimate_radius(cx, cy, xs, ys, min_r, max_r):
+    """中心 (cx, cy) からエッジ点までの距離の分布から半径を決める。
+    半径ごとに「その半径の円周上にエッジ点がどれだけあるか（円周に対する割合）」を求め、最大のものを選ぶ。
+    戻り値: (半径, 円周に対するエッジ点の割合)"""
+    d = np.hypot(xs - cx, ys - cy)
+    d = d[(d >= min_r) & (d <= max_r)]
+    if len(d) == 0:
+        return None, 0.0
+    hist = np.bincount(np.round(d).astype(int) - min_r, minlength=max_r - min_r + 1)
+    hist = np.convolve(hist, np.ones(3), mode="same")        # 輪郭の太さ・ずれを考えて 3 画素幅で数える
+    radii = np.arange(min_r, max_r + 1)
+    support = hist / (2 * np.pi * radii)
+    best = int(np.argmax(support))
+    return int(radii[best]), float(support[best])
+
+
 def draw_circle_space(img, acc, centers, votes):
     """画像の右下に円の中心の投票空間のヒートマップを描く。
-    水色の線: 票数がしきい値（votes）より多い範囲、緑の点: 検出した円の中心"""
+    水色の線: 票数がしきい値（votes）以上の範囲、緑の点: 検出した円の中心"""
     H, W = img.shape[:2]
     pw = int(W * 0.36)
     ph = int(pw * acc.shape[0] / acc.shape[1])         # 画像と同じ縦横比
     x0, y0 = W - pw - 8, H - ph - 8
-    heat = np.log1p(acc.astype(np.float32))
+    heat = np.log1p(np.maximum(acc, 0).astype(np.float32))
     heat = (heat / max(heat.max(), 1e-6) * 255).astype(np.uint8)
     heat = cv2.applyColorMap(cv2.resize(heat, (pw, ph), interpolation=cv2.INTER_LINEAR), cv2.COLORMAP_INFERNO)
-    above = cv2.resize((acc > votes).astype(np.uint8) * 255, (pw, ph), interpolation=cv2.INTER_NEAREST)
+    above = cv2.resize((acc >= votes).astype(np.uint8) * 255, (pw, ph), interpolation=cv2.INTER_NEAREST)
     above = cv2.dilate(above, np.ones((3, 3), np.uint8), iterations=2)    # 小さな山も見えるよう太らせる
     contours, _ = cv2.findContours(above, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(heat, contours, -1, (255, 255, 0), 1, cv2.LINE_AA)
@@ -818,27 +874,36 @@ def draw_circle_space(img, acc, centers, votes):
     cv2.rectangle(img, (x0, y0), (x0 + pw, y0 + ph), (255, 255, 255), 1)
     scale = max(ph / 300.0, 0.35)
     put_outlined(img, "center votes (x, y)", (x0 + 5, y0 + 16), scale, (255, 255, 255))
-    put_outlined(img, "cyan: votes > %d" % votes, (x0 + 5, y0 + 34), scale, (255, 255, 0))
+    put_outlined(img, "cyan: votes >= %d" % votes, (x0 + 5, y0 + 34), scale, (255, 255, 0))
 
 
 def proc_houghcircle(img, st):
-    # Hough 変換による円検出（勾配を使う方法）: エッジ（Canny）の点が、勾配の向きに沿って円の中心に投票し、
-    # 票の多い位置を中心とする。右下に中心の投票空間のヒートマップ（水色: しきい値より多い範囲、
-    # 緑の点: 検出した中心）。←/→ で円の中心とみなす票数のしきい値
+    # Hough 変換による円検出（勾配を使う方法）:
+    # 1. エッジ（Canny）の点が、勾配の向きに沿って円の中心になりうる位置に投票する（右下のヒートマップ）
+    # 2. 票の多い位置を中心とする（水色の線の内側が票数のしきい値以上、緑の点が検出した中心）
+    # 3. 中心からエッジ点までの距離の分布から半径を決める
+    # ←/→ で中心とみなす票数のしきい値、w で投票の仕方（1 セル / ぼかし投票）
     gray = cv2.medianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 5)
     H = gray.shape[0]
     votes = param(st, "houghcircle")
     min_r, max_r = max(H // 40, 5), H // 3
-    found = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=HOUGH_CIRCLE_DP, minDist=H / 12,
-                             param1=HOUGH_CIRCLE_CANNY, param2=votes, minRadius=min_r, maxRadius=max_r)
-    circles = [] if found is None else np.round(found[0]).astype(int)
     acc, edges = hough_circle_centers(gray, min_r, max_r)
+    space = soft_votes(acc) if st.hough_soft else acc
+    peaks = find_peaks(space, votes, min_dist=H / 12 / HOUGH_CIRCLE_DP, max_n=50)
+    ys, xs = np.nonzero(edges)
+    circles = []
+    for r, c, _ in peaks:
+        cx, cy = (c + 0.5) * HOUGH_CIRCLE_DP, (r + 0.5) * HOUGH_CIRCLE_DP     # 表のセル → 画像の座標
+        radius, support = estimate_radius(cx, cy, xs, ys, min_r, max_r)
+        if radius is not None and support >= HOUGH_CIRCLE_MIN_SUPPORT:
+            circles.append((int(round(cx)), int(round(cy)), radius))
     result = cv2.addWeighted(img, 0.5, cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR), 0.5, 0)
     for x, y, r in circles:
         cv2.circle(result, (x, y), r, (0, 255, 0), 2, cv2.LINE_AA)
         cv2.drawMarker(result, (x, y), (0, 0, 255), cv2.MARKER_CROSS, 8, 2)
-    draw_circle_space(result, acc, [(x, y) for x, y, _ in circles], votes)
-    put_info(result, "%d circles (votes > %d)" % (len(circles), votes))
+    draw_circle_space(result, space, [(x, y) for x, y, _ in circles], votes)
+    put_info(result, "%d circles (votes >= %d)" % (len(circles), votes))
+    put_info(result, voting_label(st), row=1)
     return result
 
 
@@ -948,6 +1013,7 @@ def print_help():
     print("                b ではしきい値を下げる・上げる（押すと手動になり値が固定される）")
     print("  ESC   : ぼかしと今の処理のパラメータを元に戻す（b はしきい値を自動（大津）に）")
     print("  i     : ヒストグラム表示の ON/OFF（g b e E）")
+    print("  w     : Hough 変換のぼかし投票の ON/OFF（H O。OFF は 1 つのセルにだけ 1 票）")
     print("  p     : 顔検出中に横顔検出の ON/OFF")
     print("  k     : 骨格推定中に平滑化の ON/OFF")
     print("  n     : NDI 送信の ON/OFF（ndi-python が必要・任意）")
@@ -1046,6 +1112,7 @@ def help_columns(st, ja):
     profile = "ON" if st.profile_face else "OFF"
     smooth = "OFF" if (st.pose and not st.pose.smoothing) else "ON"
     hist = "ON" if st.show_hist else "OFF"
+    soft = "ON" if st.hough_soft else "OFF"
     if ja:
         col3 += [("↑ / +", "ぼかしを強く", COLOR_ITEM),
                  ("↓ / -", "ぼかしを弱く", COLOR_ITEM),
@@ -1056,6 +1123,7 @@ def help_columns(st, ja):
                  ("", "を変える（, . でも可）", COLOR_ITEM),
                  ("ESC", "ぼかし・パラメータを元に戻す", COLOR_ITEM),
                  ("i", "ヒストグラム %s（g b e E）" % hist, COLOR_ITEM),
+                 ("w", "Hough のぼかし投票 %s（H O）" % soft, COLOR_ITEM),
                  ("p", "横顔検出 %s（F の実行中）" % profile, COLOR_ITEM),
                  ("k", "骨格の平滑化 %s（K の実行中）" % smooth, COLOR_ITEM),
                  ("n", "NDI 送信 ON/OFF（任意機能）", COLOR_ITEM),
@@ -1071,6 +1139,7 @@ def help_columns(st, ja):
                  ("", "(also , .)", COLOR_ITEM),
                  ("ESC", "reset blur & parameter", COLOR_ITEM),
                  ("i", "histogram %s (g b e E)" % hist, COLOR_ITEM),
+                 ("w", "Hough soft voting %s (H O)" % soft, COLOR_ITEM),
                  ("p", "profile face %s (during F)" % profile, COLOR_ITEM),
                  ("k", "pose smoothing %s (during K)" % smooth, COLOR_ITEM),
                  ("n", "NDI output ON/OFF (optional)", COLOR_ITEM),
@@ -1134,7 +1203,8 @@ def draw_help(img, st, drawer, cache):
     """画像を暗くしてヘルプを重ねる（文字の画像は内容が変わったときだけ作り直す）"""
     H, W = img.shape[:2]
     key = (W, H, st.proc, st.blur_proc, st.gaussian_scale, st.median_scale,
-           st.bilateral_scale, st.profile_face, bool(st.pose and st.pose.smoothing), st.show_hist)
+           st.bilateral_scale, st.profile_face, bool(st.pose and st.pose.smoothing), st.show_hist,
+           st.hough_soft)
     if cache.get("key") != key:
         cache["key"] = key
         cache["layer"] = render_help_layer(W, H, st, drawer)
@@ -1288,6 +1358,8 @@ def main():
             st.param_index.pop(st.proc, None)
         elif key == 'i':
             st.show_hist = not st.show_hist
+        elif key == 'w':
+            st.hough_soft = not st.hough_soft
         elif key == '?':
             show_help = not show_help
             if show_help:
