@@ -758,19 +758,87 @@ def proc_houghline(img, st):
     return result
 
 
+HOUGH_CIRCLE_DP = 1.5         # 円の中心の投票の表を、画像の 1/1.5 の細かさで作る
+HOUGH_CIRCLE_CANNY = 120      # 円の検出に使うエッジのしきい値（強いエッジ。弱いエッジはその半分）
+
+
+def hough_circle_centers(gray, min_r, max_r, max_points=8000):
+    """円の Hough 変換（勾配を使う方法、cv2.HOUGH_GRADIENT）の、中心の投票空間を同じ手順で計算する。
+    エッジの各点から、勾配の向き（輪郭に垂直な向き）とその逆向きに、半径 min_r〜max_r の位置へ
+    「ここが円の中心かもしれない」と 1 票ずつ入れる。円の輪郭上の点の票は、本当の中心に集まる。
+    （半径は、中心が決まったあとで、エッジ点までの距離の分布から決める）
+    戻り値: (投票数の表（画像の 1/dp の大きさ）, エッジ画像)"""
+    dx = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3, borderType=cv2.BORDER_REPLICATE)
+    dy = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3, borderType=cv2.BORDER_REPLICATE)
+    edges = cv2.Canny(dx, dy, HOUGH_CIRCLE_CANNY // 2, HOUGH_CIRCLE_CANNY)
+    ys, xs = np.nonzero(edges)
+    vx, vy = dx[ys, xs].astype(np.float64), dy[ys, xs].astype(np.float64)
+    mag = np.hypot(vx, vy)
+    keep = mag >= 1.0
+    xs, ys, vx, vy, mag = xs[keep], ys[keep], vx[keep], vy[keep], mag[keep]
+    ratio = 1.0
+    if len(xs) > max_points:                     # 点が多いときは間引き、その分だけ票数を補正する
+        ratio = len(xs) / max_points
+        idx = np.linspace(0, len(xs) - 1, max_points).astype(int)
+        xs, ys, vx, vy, mag = xs[idx], ys[idx], vx[idx], vy[idx], mag[idx]
+    idp = 1.0 / HOUGH_CIRCLE_DP
+    H, W = gray.shape
+    acols, arows = int(np.ceil(W * idp)), int(np.ceil(H * idp))
+    # OpenCV と同じく 1024 倍の固定小数点で計算する（1 歩で画像上の 1 画素ずつ進む）
+    x0, y0 = np.rint(xs * idp * 1024).astype(np.int64), np.rint(ys * idp * 1024).astype(np.int64)
+    sx, sy = np.rint(vx * idp * 1024 / mag).astype(np.int64), np.rint(vy * idp * 1024 / mag).astype(np.int64)
+    r = np.arange(min_r, max_r + 1)
+    acc = np.zeros(arows * acols, np.float64)
+    for sign in (1, -1):                         # 勾配の向きと、その逆向き
+        ax = (x0[:, None] + sign * r * sx[:, None]) >> 10
+        ay = (y0[:, None] + sign * r * sy[:, None]) >> 10
+        # 表の外に出たら、その先は数えない（OpenCV と同じ）
+        inside = np.cumprod((ax >= 0) & (ax < acols) & (ay >= 0) & (ay < arows), axis=1).astype(bool)
+        acc += np.bincount((ay * acols + ax)[inside], minlength=arows * acols)
+    return acc.reshape(arows, acols) * ratio, edges
+
+
+def draw_circle_space(img, acc, centers, votes):
+    """画像の右下に円の中心の投票空間のヒートマップを描く。
+    水色の線: 票数がしきい値（votes）より多い範囲、緑の点: 検出した円の中心"""
+    H, W = img.shape[:2]
+    pw = int(W * 0.36)
+    ph = int(pw * acc.shape[0] / acc.shape[1])         # 画像と同じ縦横比
+    x0, y0 = W - pw - 8, H - ph - 8
+    heat = np.log1p(acc.astype(np.float32))
+    heat = (heat / max(heat.max(), 1e-6) * 255).astype(np.uint8)
+    heat = cv2.applyColorMap(cv2.resize(heat, (pw, ph), interpolation=cv2.INTER_LINEAR), cv2.COLORMAP_INFERNO)
+    above = cv2.resize((acc > votes).astype(np.uint8) * 255, (pw, ph), interpolation=cv2.INTER_NEAREST)
+    above = cv2.dilate(above, np.ones((3, 3), np.uint8), iterations=2)    # 小さな山も見えるよう太らせる
+    contours, _ = cv2.findContours(above, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(heat, contours, -1, (255, 255, 0), 1, cv2.LINE_AA)
+    for x, y in centers:
+        cv2.circle(heat, (int(x * pw / W), int(y * ph / H)), 3, (0, 255, 0), -1, cv2.LINE_AA)
+    img[y0:y0 + ph, x0:x0 + pw] = heat
+    cv2.rectangle(img, (x0, y0), (x0 + pw, y0 + ph), (255, 255, 255), 1)
+    scale = max(ph / 300.0, 0.35)
+    put_outlined(img, "center votes (x, y)", (x0 + 5, y0 + 16), scale, (255, 255, 255))
+    put_outlined(img, "cyan: votes > %d" % votes, (x0 + 5, y0 + 34), scale, (255, 255, 0))
+
+
 def proc_houghcircle(img, st):
-    # Hough 変換による円検出（勾配を使う方法）。←/→ で円の中心とみなす票数のしきい値
+    # Hough 変換による円検出（勾配を使う方法）: エッジ（Canny）の点が、勾配の向きに沿って円の中心に投票し、
+    # 票の多い位置を中心とする。右下に中心の投票空間のヒートマップ（水色: しきい値より多い範囲、
+    # 緑の点: 検出した中心）。←/→ で円の中心とみなす票数のしきい値
     gray = cv2.medianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 5)
     H = gray.shape[0]
     votes = param(st, "houghcircle")
-    found = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1.5, minDist=H / 12, param1=120,
-                             param2=votes, minRadius=max(H // 40, 5), maxRadius=H // 3)
+    min_r, max_r = max(H // 40, 5), H // 3
+    found = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=HOUGH_CIRCLE_DP, minDist=H / 12,
+                             param1=HOUGH_CIRCLE_CANNY, param2=votes, minRadius=min_r, maxRadius=max_r)
     circles = [] if found is None else np.round(found[0]).astype(int)
-    result = img.copy()
+    acc, edges = hough_circle_centers(gray, min_r, max_r)
+    result = cv2.addWeighted(img, 0.5, cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR), 0.5, 0)
     for x, y, r in circles:
         cv2.circle(result, (x, y), r, (0, 255, 0), 2, cv2.LINE_AA)
         cv2.drawMarker(result, (x, y), (0, 0, 255), cv2.MARKER_CROSS, 8, 2)
-    put_info(result, "%d circles (votes >= %d)" % (len(circles), votes))
+    draw_circle_space(result, acc, [(x, y) for x, y, _ in circles], votes)
+    put_info(result, "%d circles (votes > %d)" % (len(circles), votes))
     return result
 
 
@@ -823,7 +891,7 @@ PROCS = {
     'Q': ("quantize",      proc_quantize,      "量子化（ビット数）"),
     'Z': ("sampling",      proc_sampling,      "標本化（ブロックの大きさ）"),
     'H': ("houghline",     proc_houghline,     "Hough 変換: 直線と投票空間"),
-    'O': ("houghcircle",   proc_houghcircle,   "Hough 変換: 円"),
+    'O': ("houghcircle",   proc_houghcircle,   "Hough 変換: 円と中心の投票空間"),
     'P': ("pedestrian",    proc_pedestrian,    "人物検出（HOG + SVM）"),
     'b': ("binary",        proc_binary,        "二値化（大津の方法）"),
     ':': ("sift",          proc_sift,          "SIFT 特徴点"),
@@ -900,7 +968,7 @@ HELP_EN = {   # OpenCV 4 用の英語の説明（ない処理は処理名をそ�
     "hue": "Hue only", "saturation": "Saturation only (S of HSV)", "value": "Value only (V of HSV)",
     "channels": "Color channels (RGB YIQ HSV Lab)", "quantize": "Quantization (bits)",
     "sampling": "Sampling (block size)",
-    "houghline": "Hough transform: lines & vote space", "houghcircle": "Hough transform: circles",
+    "houghline": "Hough transform: lines & vote space", "houghcircle": "Hough transform: circles & center votes",
     "pedestrian": "Person detection (HOG + SVM)",
     "binary": "Binarize (Otsu)", "sift": "SIFT keypoints",
     "denseflow": "Dense optical flow (Farneback)", "labeling": "Labeling",
