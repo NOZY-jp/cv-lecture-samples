@@ -96,7 +96,6 @@ class State:
         self.show_hist = True
         self.hog = None           # HOG 特徴 + SVM の人物検出器
         self.hough_sigma = 0      # Hough 変換のぼかし投票の広がり σ（0 は 1 つのセルにだけ 1 票。w キーで切り替え）
-        self.hough_removal = True # 直線の検出: True = 逆投影による逐次検出、False = 非極大値の抑制（r キー）
 
         # 二値化のしきい値: None なら大津の方法で毎フレーム自動、数値なら ←/→ で決めた手動の値
         self.bin_manual = None
@@ -705,12 +704,12 @@ def proc_sampling(img, st):
     return result
 
 
-MAX_HOUGH_LINES = 40
-HOUGH_SIGMAS = [0, 1, 2, 4]   # ぼかし投票の広がり σ [セル]（w キーで順に切り替え。0 は 1 セル投票）
+MAX_HOUGH_LINES = 100        # 描く直線の数の上限（cv2.HoughLines は票の多い順に返す）
+HOUGH_SIGMAS = [0, 1, 2, 4]   # 円の検出のぼかし投票の広がり σ [セル]（w キーで順に切り替え。0 は 1 セル投票）
 # ぼかし投票では周りの票も加わって山の票数が大きくなるので、σ ごとのしきい値の最初の値は、
 # 1 セル投票の最初の値にこの倍率を掛けたものにする（サンプル画像で、本物の直線・円が同程度に検出される比を測った目安）。
 # しきい値は σ ごとに別々に覚えるので、←/→ で調整した値は σ を切り替えても残る
-HOUGH_SIGMA_GAIN = {"houghline": {0: 1, 1: 3, 2: 10, 4: 33}, "houghcircle": {0: 1, 1: 5, 2: 15, 4: 40}}
+HOUGH_SIGMA_GAIN = {"houghcircle": {0: 1, 1: 5, 2: 15, 4: 40}}
 
 
 def soft_votes(acc, sigma, wrap=False):
@@ -758,18 +757,11 @@ def voting_label(st):
     return "voting: blurred sigma=%d (w: next)" % st.hough_sigma
 
 
-def line_votes(xs, ys, diag):
-    """エッジ点 (x, y) ごとに、θ を 0〜179° で動かして ρ = x cosθ + y sinθ の位置に 1 票入れた表 [ρ + diag, θ]"""
-    thetas = np.deg2rad(np.arange(180))
-    rho = np.round(xs[:, None] * np.cos(thetas) + ys[:, None] * np.sin(thetas)).astype(np.int64) + diag
-    acc = np.bincount((rho * 180 + np.arange(180)).ravel(), minlength=(2 * diag + 1) * 180)
-    return acc.reshape(2 * diag + 1, 180).astype(np.float32)
-
-
-def hough_accumulator(edges, max_points=30000):
+def hough_accumulator(edges, max_points=15000):
     """直線の Hough 変換の投票空間を、cv2.HoughLines（ρ: 1 画素, θ: 1° 刻み）と同じ細かさで計算する。
-    エッジ点が多いときは max_points 個に間引き、その分だけ票数を補正する（ratio 倍）。
-    戻り値: (投票数の表 [ρ + 対角線の長さ, θ], 対角線の長さ, 投票した点の x, y, 票数の補正の倍率)"""
+    エッジ点 (x, y) ごとに、θ を 0〜179° で動かして ρ = x cosθ + y sinθ の位置に 1 票入れる。
+    エッジ点が多いときは max_points 個に間引き、その分だけ票数を補正する（検出の票数と比べられるように）。
+    戻り値: (投票数の表 [ρ + 対角線の長さ, θ], 対角線の長さ)"""
     ys, xs = np.nonzero(edges)
     ratio = 1.0
     if len(xs) > max_points:
@@ -777,66 +769,10 @@ def hough_accumulator(edges, max_points=30000):
         idx = np.linspace(0, len(xs) - 1, max_points).astype(int)
         xs, ys = xs[idx], ys[idx]
     diag = int(np.ceil(np.hypot(*edges.shape)))
-    return line_votes(xs, ys, diag) * ratio, diag, xs, ys, ratio
-
-
-HOUGH_SUPPORT_DIST = 3.0      # 直線からこの距離 [画素] 以内のエッジ点を、その直線に投票した点とみなす（逆投影）。
-                              # 太さのある線は両側の縁が 2〜3 画素離れた 2 本のエッジになるので、両方を含める
-
-
-def line_support(xs, ys, rho, theta, dist=HOUGH_SUPPORT_DIST):
-    """逆投影: 直線 (ρ, θ) に投票した点（直線からの距離が dist 以内の点）を True とする配列"""
-    return np.abs(xs * np.cos(theta) + ys * np.sin(theta) - rho) <= dist
-
-
-def detect_lines_by_removal(acc, diag, xs, ys, ratio, votes, sigma, max_n):
-    """逆投影による逐次検出:
-    1. 投票空間で最も票の多い (ρ, θ) を直線とする（しきい値未満になったら終わり）
-    2. 逆投影で、その直線に投票した点を求め、それらの点の票を投票空間から取り除く
-    3. 1 に戻る
-    同じ直線の票は 2 で消えるので重複して検出されず、近くの別の直線は自分の点の票が残るので検出できる。
-    戻り値: [(ρ, θ), ...]"""
-    acc = acc.copy()
-    alive = np.ones(len(xs), bool)
-    dist = max(HOUGH_SUPPORT_DIST, sigma)          # ぼかし投票では、広げた分だけ逆投影の幅も広げる
-    lines = []
-    for _ in range(max_n):
-        space = soft_votes(acc, sigma, wrap=True)
-        r, c = np.unravel_index(int(np.argmax(space)), space.shape)
-        if space[r, c] < votes:
-            break
-        rho, theta = float(r - diag), float(np.deg2rad(c))
-        sup = alive & line_support(xs, ys, rho, theta, dist)
-        if not sup.any():                           # 票を取り除けない（念のため）: そのセルを消して続ける
-            acc[max(r - 1, 0):r + 2, max(c - 1, 0):c + 2] = 0
-            continue
-        lines.append((rho, theta))
-        acc -= line_votes(xs[sup], ys[sup], diag) * ratio
-        alive &= ~sup
-    return lines
-
-
-LINE_COLORS = [(0, 0, 255), (0, 200, 255), (0, 255, 0), (255, 255, 0), (255, 100, 0), (255, 0, 255),
-               (128, 0, 255), (0, 128, 255)]
-
-
-def draw_lines_with_support(result, edges, lines):
-    """逆投影の表示: 検出した直線ごとに、その直線に投票したエッジ点（直線から HOUGH_SUPPORT_DIST 画素以内）を
-    直線ごとの色で塗る。直線そのものは描かないので、どのエッジ点が直線として検出されたかがそのまま見える。
-    （1 つの点が複数の直線に投票している場合は、先に検出された直線の色にする）"""
-    ys, xs = np.nonzero(edges)
-    used = np.zeros(len(xs), bool)
-    mask = np.zeros(edges.shape, np.uint8)
-    colors = np.zeros(edges.shape + (3,), np.uint8)
-    for i, (rho, theta) in enumerate(lines):
-        sup = line_support(xs, ys, rho, theta) & ~used
-        used |= sup
-        colors[ys[sup], xs[sup]] = LINE_COLORS[i % len(LINE_COLORS)]
-        mask[ys[sup], xs[sup]] = 255
-    # 点が見やすいよう、1 画素太らせて描く
-    grown = cv2.dilate(mask, np.ones((3, 3), np.uint8)) > 0
-    colors = cv2.dilate(colors, np.ones((3, 3), np.uint8))
-    result[grown] = colors[grown]
+    thetas = np.deg2rad(np.arange(180))
+    rho = np.round(xs[:, None] * np.cos(thetas) + ys[:, None] * np.sin(thetas)).astype(np.int64) + diag
+    acc = np.bincount((rho * 180 + np.arange(180)).ravel(), minlength=(2 * diag + 1) * 180)
+    return acc.reshape(2 * diag + 1, 180) * ratio, diag
 
 
 def draw_hough_space(img, acc, diag, lines, votes):
@@ -870,31 +806,24 @@ def draw_hough_space(img, acc, diag, lines, votes):
 
 
 def proc_houghline(img, st):
-    # Hough 変換による直線検出: エッジ（Canny）の点が、通りうるすべての直線 (ρ, θ) に投票し、
-    # 票の多い (ρ, θ) を直線とする。右下に投票空間のヒートマップ（水色の線の内側が票数のしきい値以上、
-    # 緑の点が検出した直線）。←/→ で直線とみなす票数のしきい値、w で投票の仕方（1 セル / ぼかし投票）、
-    # r で検出の仕方（逆投影による逐次検出 / 非極大値の抑制）。
-    # 各直線に投票したエッジ点（逆投影）を直線ごとの色で塗る（直線そのものは描かない）
+    # Hough 変換による直線検出（OpenCV の cv2.HoughLines）: エッジ（Canny）の点が投票し、票の多い (ρ, θ) を直線とする
+    # 右下に投票空間のヒートマップ（水色の線の内側が票数のしきい値以上、緑の点が検出した直線）。
+    # ←/→ で直線とみなす票数のしきい値を変えると、水色の範囲と検出される直線が変わる
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     votes = param(st, "houghline")
-    acc, diag, xs, ys, ratio = hough_accumulator(edges)
-    sg = st.hough_sigma
-    space = soft_votes(acc, sg, wrap=True)
-    if st.hough_removal:
-        # 逆投影による逐次検出（検出した直線に投票した点の票を取り除きながら、1 本ずつ選ぶ）
-        lines = detect_lines_by_removal(acc, diag, xs, ys, ratio, votes, sg, MAX_HOUGH_LINES)
-    else:
-        # 非極大値の抑制: ρ ±max(15, 3σ) 画素、θ ±max(5, 3σ) 度の範囲で最大のセルだけを残す
-        peaks = find_peaks(space, votes, max(15, 3 * sg), max(5, 3 * sg), MAX_HOUGH_LINES, wrap=True)
-        lines = [(r - diag, np.deg2rad(c)) for r, c, _ in peaks]      # 行 → ρ、列 → θ（度）
+    found = cv2.HoughLines(edges, 1, np.pi / 180, votes)
+    lines = [] if found is None else [tuple(l) for l in found[:MAX_HOUGH_LINES, 0]]
     result = cv2.addWeighted(img, 0.5, cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR), 0.5, 0)
-    draw_lines_with_support(result, edges, lines)
-    draw_hough_space(result, space, diag, lines, votes)
+    L = int(np.hypot(*img.shape[:2]))
+    for rho, theta in lines:
+        a, b = np.cos(theta), np.sin(theta)
+        x, y = a * rho, b * rho
+        cv2.line(result, (int(x - L * b), int(y + L * a)), (int(x + L * b), int(y - L * a)),
+                 (0, 0, 255), 2, cv2.LINE_AA)
+    acc, diag = hough_accumulator(edges)
+    draw_hough_space(result, acc, diag, lines, votes)
     put_info(result, "%d lines (votes >= %d)" % (len(lines), votes))
-    put_info(result, voting_label(st), row=1)
-    put_info(result, "detection: back-projection removal (r: NMS)" if st.hough_removal
-             else "detection: NMS window (r: back-projection)", row=2)
     return result
 
 
@@ -1118,8 +1047,7 @@ def print_help():
     print("                b ではしきい値を下げる・上げる（押すと手動になり値が固定される）")
     print("  ESC   : ぼかしと今の処理のパラメータを元に戻す（b はしきい値を自動（大津）に）")
     print("  i     : ヒストグラム表示の ON/OFF（g b e E）")
-    print("  w     : Hough 変換の投票の広がりを切り替え（H O。1 セル → σ=1 → 2 → 4 セルのぼかし投票）")
-    print("  r     : 直線の検出の仕方を切り替え（H。逆投影で票を取り除く逐次検出 / 非極大値の抑制）")
+    print("  w     : 円の Hough 変換の投票の広がりを切り替え（O。1 セル → σ=1 → 2 → 4 セルのぼかし投票）")
     print("  p     : 顔検出中に横顔検出の ON/OFF")
     print("  k     : 骨格推定中に平滑化の ON/OFF")
     print("  n     : NDI 送信の ON/OFF（ndi-python が必要・任意）")
@@ -1229,8 +1157,7 @@ def help_columns(st, ja):
                  ("", "を変える（, . でも可）", COLOR_ITEM),
                  ("ESC", "ぼかし・パラメータを元に戻す", COLOR_ITEM),
                  ("i", "ヒストグラム %s（g b e E）" % hist, COLOR_ITEM),
-                 ("w", "Hough のぼかし投票 %s（H O）" % soft, COLOR_ITEM),
-                 ("r", "直線の検出 %s（H）" % ("逆投影" if st.hough_removal else "非極大値抑制"), COLOR_ITEM),
+                 ("w", "円の Hough のぼかし投票 %s（O）" % soft, COLOR_ITEM),
                  ("p", "横顔検出 %s（F の実行中）" % profile, COLOR_ITEM),
                  ("k", "骨格の平滑化 %s（K の実行中）" % smooth, COLOR_ITEM),
                  ("n", "NDI 送信 ON/OFF（任意機能）", COLOR_ITEM),
@@ -1246,8 +1173,7 @@ def help_columns(st, ja):
                  ("", "(also , .)", COLOR_ITEM),
                  ("ESC", "reset blur & parameter", COLOR_ITEM),
                  ("i", "histogram %s (g b e E)" % hist, COLOR_ITEM),
-                 ("w", "Hough soft voting %s (H O)" % soft, COLOR_ITEM),
-                 ("r", "line detection: %s (H)" % ("back-proj." if st.hough_removal else "NMS"), COLOR_ITEM),
+                 ("w", "circle Hough soft voting %s (O)" % soft, COLOR_ITEM),
                  ("p", "profile face %s (during F)" % profile, COLOR_ITEM),
                  ("k", "pose smoothing %s (during K)" % smooth, COLOR_ITEM),
                  ("n", "NDI output ON/OFF (optional)", COLOR_ITEM),
@@ -1312,7 +1238,7 @@ def draw_help(img, st, drawer, cache):
     H, W = img.shape[:2]
     key = (W, H, st.proc, st.blur_proc, st.gaussian_scale, st.median_scale,
            st.bilateral_scale, st.profile_face, bool(st.pose and st.pose.smoothing), st.show_hist,
-           st.hough_sigma, st.hough_removal)
+           st.hough_sigma)
     if cache.get("key") != key:
         cache["key"] = key
         cache["layer"] = render_help_layer(W, H, st, drawer)
@@ -1466,8 +1392,6 @@ def main():
             st.param_index.pop(param_key(st, st.proc), None)
         elif key == 'i':
             st.show_hist = not st.show_hist
-        elif key == 'r':
-            st.hough_removal = not st.hough_removal
         elif key == 'w':
             # ぼかし投票の広がりを 0（1 セル投票）→ 1 → 2 → 4 → 0 … と切り替える
             i = HOUGH_SIGMAS.index(st.hough_sigma)
