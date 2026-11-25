@@ -775,8 +775,8 @@ HOUGH_KEYS = [("<- ->", "vote threshold"),
               ("?", "all keys")]
 
 
-def draw_key_guide(img, items, max_w):
-    """画像の左下に、この処理で使えるキーの一覧を半透明の黒い枠の中に描く（常に表示）。
+def draw_key_guide(img, items, max_w, top=False):
+    """画像の左下（top=True なら左上）に、この処理で使えるキーの一覧を半透明の黒い枠の中に描く（常に表示）。
     items: [(キー, 説明), ...]、max_w: 枠の幅の上限（右下のヒートマップに重ならないように）"""
     H = img.shape[0]
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -790,7 +790,7 @@ def draw_key_guide(img, items, max_w):
         total = max_w
     lh = int(cv2.getTextSize("Ag", font, scale, 1)[0][1] * 1.8)
     bw, bh = int(total), lh * len(items) + 8
-    x0, y0 = 8, H - bh - 8
+    x0, y0 = 8, (8 if top else H - bh - 8)
     roi = img[y0:y0 + bh, x0:x0 + bw]
     roi[:] = cv2.addWeighted(roi, 0.35, np.zeros_like(roi), 0.65, 0)
     for i, (k, d) in enumerate(items):
@@ -1033,10 +1033,10 @@ def hog_glyphs(size):
     return glyphs
 
 
-def hog_cells(desc, ncx, ncy):
+def hog_cells(desc, ncx, ncy, total=False):
     """HOGDescriptor.compute の結果を、セルごとの向きのヒストグラム [セルの行, 列, 向き] に戻す。
     特徴は 2x2 セルのブロックごとに正規化して並べてあり（ブロックもブロック内のセルも列の順）、
-    1 つのセルは最大 4 つのブロックに含まれるので、それらの平均をとる"""
+    1 つのセルは最大 4 つのブロックに含まれるので、それらの平均をとる（total=True なら合計）"""
     nbx, nby = ncx - 1, ncy - 1
     d = np.asarray(desc, np.float32).reshape(nbx, nby, 2, 2, HOG_BINS)   # [ブロック x, y, セル x, y, 向き]
     cells = np.zeros((ncy, ncx, HOG_BINS), np.float32)
@@ -1045,7 +1045,7 @@ def hog_cells(desc, ncx, ncy):
         for j in (0, 1):
             cells[j:j + nby, i:i + nbx] += d[:, :, i, j].transpose(1, 0, 2)
             count[j:j + nby, i:i + nbx] += 1
-    return cells / count
+    return cells if total else cells / count
 
 
 def render_hog(cells, size, scale=None):
@@ -1081,27 +1081,42 @@ def hog_of_image(img):
     return cells
 
 
-def draw_person_hog(result, small, rect, s, st):
-    """検出した人物の窓について、画面の右下に 3 つの図を並べる:
-    窓の画像（64x128 に縮めたもの）、その HOG 特徴、SVM の重み（正の部分）。
-    窓の HOG 特徴と SVM の重みの内積 + バイアスが、人物らしさの値（score）になる"""
+PERSON_TILES = 4   # 人物の窓の図の数（窓の画像・HOG・SVM の重み・寄与）
+
+
+def person_panel(H, W):
+    """人物の窓の図を並べる場所: (セルの大きさ, 図の幅, 図の高さ, 左端 x, 上端 y, 図の間隔)"""
+    size = max(int(H * 0.5) // 16, 4)                      # 窓は 8 x 16 セル
+    tw, th, gap = 8 * size, 16 * size, 6
+    return size, tw, th, W - PERSON_TILES * tw - (PERSON_TILES - 1) * gap - 8, H - th - 8, gap
+
+
+def draw_person_hog(result, small, rect, st):
+    """検出した人物の窓について、画面の右下に 4 つの図を並べる:
+    window: 窓の画像（64x128 に縮めたもの）、HOG: その HOG 特徴、
+    SVM w > 0: 学習済みの SVM の重み（正の部分。検出器が探している形で、入力によらず一定）、
+    HOG x w: 特徴と重みの積（寄与）。緑はプラス（人物らしさを上げた）、赤はマイナス（下げた）。
+    寄与をすべて足してバイアス b を加えたものが、人物らしさの値（score = HOG . w + b）になる"""
     x, y, w, h = rect
     win = st.hog.winSize                                   # (64, 128)
     crop = cv2.resize(small[max(y, 0):y + h, max(x, 0):x + w], win, interpolation=cv2.INTER_AREA)
     feat = st.hog.compute(crop).ravel()
     svm = np.asarray(st.hog.getSVMDetector() if hasattr(st.hog, "getSVMDetector")
                      else st.hog.svmDetector, np.float32).ravel()
-    score = float(feat @ svm[:-1] + svm[-1])
+    contrib = feat * svm[:-1]
+    bias = float(svm[-1])
+    score = float(contrib.sum() + bias)
     ncx, ncy = win[0] // HOG_CELL, win[1] // HOG_CELL
     H, W = result.shape[:2]
-    size = max(int(H * 0.5) // ncy, 4)                     # 図のセルの大きさ（画素）
-    tw, th = ncx * size, ncy * size
+    size, tw, th, x0, y0, gap = person_panel(H, W)
+    c = hog_cells(contrib, ncx, ncy, total=True)           # セルごと・向きごとの寄与の合計
+    cscale = np.percentile(np.abs(c), 99.5)
+    pos, neg = render_hog(c, size, cscale), render_hog(-c, size, cscale)
+    contrib_img = (np.dstack([np.zeros_like(pos), pos, neg]) * 255).astype(np.uint8)   # BGR: 緑 = +、赤 = -
     tiles = [(cv2.resize(crop, (tw, th), interpolation=cv2.INTER_LINEAR), "window"),
              (render_hog(hog_cells(feat, ncx, ncy), size), "HOG"),
-             (render_hog(hog_cells(svm[:-1], ncx, ncy), size), "SVM w > 0")]
-    gap = 6
-    x0 = W - 3 * tw - 2 * gap - 8
-    y0 = H - th - 8
+             (render_hog(hog_cells(svm[:-1], ncx, ncy), size), "SVM w > 0"),
+             (contrib_img, "HOG x w")]
     fscale = max(H / 900.0, 0.3)
     for k, (tile, name) in enumerate(tiles):
         if tile.dtype != np.uint8:
@@ -1110,14 +1125,19 @@ def draw_person_hog(result, small, rect, s, st):
         result[y0:y0 + th, tx:tx + tw] = tile
         cv2.rectangle(result, (tx, y0), (tx + tw, y0 + th), (255, 255, 255), 1)
         put_outlined(result, name, (tx + 3, y0 + th - 5), fscale, (0, 255, 255))
-    put_outlined(result, "score = HOG . w + b = %.2f" % score, (x0, y0 - 8), fscale, (0, 255, 255))
+    lh = int(cv2.getTextSize("Ag", cv2.FONT_HERSHEY_SIMPLEX, fscale, 1)[0][1] * 1.8)
+    tx = x0 + 3 * (tw + gap)
+    put_outlined(result, "score = HOG . w + b = %.2f" % score, (x0, y0 - 8 - lh), fscale, (0, 255, 255))
+    put_outlined(result, "green +%.2f" % contrib[contrib > 0].sum(), (x0, y0 - 8), fscale, (0, 255, 0))
+    put_outlined(result, "red %.2f" % contrib[contrib < 0].sum(), (x0 + int(tw * 1.25), y0 - 8), fscale, (80, 80, 255))
+    put_outlined(result, "b %.2f" % bias, (x0 + int(tw * 2.3), y0 - 8), fscale, (255, 255, 255))
 
 
 def proc_pedestrian(img, st):
     # HOG 特徴 + 線形 SVM による人物（歩行者）検出。64x128 画素の窓を動かしながら、
     # 窓内の HOG 特徴を SVM で「人／人でない」に分類する（全身が映っている必要がある）
     # ←/→ で SVM の判定のしきい値（大きいほど厳しい）、o で画像全体の HOG 特徴の表示
-    # 人物を検出したら、いちばん人物らしい窓の画像・HOG 特徴・SVM の重みを右下に表示する
+    # 人物を検出したら、いちばん人物らしい窓の画像・HOG 特徴・SVM の重み・寄与（特徴 x 重み）を右下に表示する
     if not load_hog(st):
         return show_unavailable(img, "HOG + SVM not available")
     s = min(1.0, 640.0 / img.shape[1])                  # 速さのため幅 640 画素以下にして検出
@@ -1142,12 +1162,12 @@ def proc_pedestrian(img, st):
         cv2.putText(result, "%.2f" % wt, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
     if len(rects):
         best = int(np.argmax(weights))
-        draw_person_hog(result, small, rects[best], s, st)
+        draw_person_hog(result, small, rects[best], st)
         bx, by, bw, bh = [int(v / s) for v in rects[best]]
         cv2.rectangle(result, (bx, by), (bx + bw, by + bh), (0, 255, 255), 2)
     put_info(result, "%d persons (SVM threshold %.2f)" % (len(rects), thr))
     put_info(result, "HOG view (o: off)" if st.hog_view else "o: HOG view", row=1)
-    draw_key_guide(result, PEDESTRIAN_KEYS, int(result.shape[1] * 0.45))
+    draw_key_guide(result, PEDESTRIAN_KEYS, int(result.shape[1] * 0.45), top=True)   # 右下は人物の窓の図
     return result
 
 
