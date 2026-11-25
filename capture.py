@@ -832,25 +832,22 @@ LINE_COLORS = [(0, 0, 255), (0, 200, 255), (0, 255, 0), (255, 255, 0), (255, 100
 
 
 def draw_lines_with_support(result, edges, lines):
-    """検出した直線と、逆投影で求めたその直線に投票した点を、同じ色で描く。
-    点がある範囲（直線に沿った両端）を太い線分、直線全体を細い線で描く"""
+    """逆投影の表示: 検出した直線ごとに、その直線に投票したエッジ点（直線から HOUGH_SUPPORT_DIST 画素以内）を
+    直線ごとの色で塗る。直線そのものは描かないので、どのエッジ点が直線として検出されたかがそのまま見える。
+    （1 つの点が複数の直線に投票している場合は、先に検出された直線の色にする）"""
     ys, xs = np.nonzero(edges)
     used = np.zeros(len(xs), bool)
-    L = int(np.hypot(*result.shape[:2]))
+    mask = np.zeros(edges.shape, np.uint8)
+    colors = np.zeros(edges.shape + (3,), np.uint8)
     for i, (rho, theta) in enumerate(lines):
-        color = LINE_COLORS[i % len(LINE_COLORS)]
-        a, b = np.cos(theta), np.sin(theta)
-        x0, y0 = a * rho, b * rho
-        cv2.line(result, (int(x0 - L * b), int(y0 + L * a)), (int(x0 + L * b), int(y0 - L * a)), color, 1, cv2.LINE_AA)
         sup = line_support(xs, ys, rho, theta) & ~used
         used |= sup
-        if not sup.any():
-            continue
-        result[ys[sup], xs[sup]] = color                       # この直線に投票した点
-        t = -xs[sup] * b + ys[sup] * a                          # 直線に沿った位置
-        p1 = (int(x0 - t.min() * b), int(y0 + t.min() * a))
-        p2 = (int(x0 - t.max() * b), int(y0 + t.max() * a))
-        cv2.line(result, p1, p2, color, 3, cv2.LINE_AA)        # 点がある範囲
+        colors[ys[sup], xs[sup]] = LINE_COLORS[i % len(LINE_COLORS)]
+        mask[ys[sup], xs[sup]] = 255
+    # 点が見やすいよう、1 画素太らせて描く
+    grown = cv2.dilate(mask, np.ones((3, 3), np.uint8)) > 0
+    colors = cv2.dilate(colors, np.ones((3, 3), np.uint8))
+    result[grown] = colors[grown]
 
 
 def draw_hough_space(img, acc, diag, lines, votes):
@@ -888,7 +885,7 @@ def proc_houghline(img, st):
     # 票の多い (ρ, θ) を直線とする。右下に投票空間のヒートマップ（水色の線の内側が票数のしきい値以上、
     # 緑の点が検出した直線）。←/→ で直線とみなす票数のしきい値、w で投票の仕方（1 セル / ぼかし投票）、
     # r で検出の仕方（逆投影による逐次検出 / 非極大値の抑制）。
-    # 各直線に投票した点（逆投影）を同じ色で塗り、点がある範囲を太い線分で示す
+    # 各直線に投票したエッジ点（逆投影）を直線ごとの色で塗る（直線そのものは描かない）
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     votes = param(st, "houghline")
