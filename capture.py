@@ -716,11 +716,11 @@ def proc_sampling(img, st):
 
 
 MAX_HOUGH_LINES = 100        # 描く直線の数の上限（cv2.HoughLines は票の多い順に返す）
-HOUGH_SIGMAS = [0, 1, 2, 4]   # 円の検出のぼかし投票の広がり σ [セル]（w キーで順に切り替え。0 は 1 セル投票）
+HOUGH_SIGMAS = [0, 1, 2, 4]   # ぼかし投票の広がり σ [セル]（w キーで順に切り替え。0 は 1 セル投票）
 # ぼかし投票では周りの票も加わって山の票数が大きくなるので、σ ごとのしきい値の最初の値は、
 # 1 セル投票の最初の値にこの倍率を掛けたものにする（サンプル画像で、本物の直線・円が同程度に検出される比を測った目安）。
 # しきい値は σ ごとに別々に覚えるので、←/→ で調整した値は σ を切り替えても残る
-HOUGH_SIGMA_GAIN = {"houghcircle": {0: 1, 1: 5, 2: 15, 4: 40}}
+HOUGH_SIGMA_GAIN = {"houghline": {0: 1, 1: 3, 2: 10, 4: 33}, "houghcircle": {0: 1, 1: 5, 2: 15, 4: 40}}
 
 
 def soft_votes(acc, sigma, wrap=False):
@@ -819,12 +819,25 @@ def draw_hough_space(img, acc, diag, lines, votes):
 def proc_houghline(img, st):
     # Hough 変換による直線検出（OpenCV の cv2.HoughLines）: エッジ（Canny）の点が投票し、票の多い (ρ, θ) を直線とする
     # 右下に投票空間のヒートマップ（水色の線の内側が票数のしきい値以上、緑の点が検出した直線）。
-    # ←/→ で直線とみなす票数のしきい値を変えると、水色の範囲と検出される直線が変わる
+    # ←/→ で直線とみなす票数のしきい値を変えると、水色の範囲と検出される直線が変わる。
+    # w で投票の仕方（1 セル投票 = cv2.HoughLines / σ = 1, 2, 4 のぼかし投票）を切り替える
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     votes = param(st, "houghline")
-    found = cv2.HoughLines(edges, 1, np.pi / 180, votes)
-    lines = [] if found is None else [tuple(l) for l in found[:MAX_HOUGH_LINES, 0]]
+    sg = st.hough_sigma
+    if sg == 0:
+        # 1 セル投票: OpenCV の cv2.HoughLines で検出する
+        found = cv2.HoughLines(edges, 1, np.pi / 180, votes)
+        lines = [] if found is None else [tuple(l) for l in found[:MAX_HOUGH_LINES, 0]]
+        acc, diag = hough_accumulator(edges)
+        space = acc
+    else:
+        # ぼかし投票: 自前の投票空間をぼかし、ρ ±max(15, 3σ) 画素・θ ±max(5, 3σ) 度の範囲で
+        # 票数が最大のセル（非極大値の抑制）のうち、しきい値以上のものを直線とする
+        acc, diag = hough_accumulator(edges, max_points=30000)
+        space = soft_votes(acc, sg, wrap=True)
+        peaks = find_peaks(space, votes, max(15, 3 * sg), max(5, 3 * sg), MAX_HOUGH_LINES, wrap=True)
+        lines = [(r - diag, np.deg2rad(c)) for r, c, _ in peaks]          # 行 → ρ、列 → θ（度）
     st.found = len(lines)
     result = cv2.addWeighted(img, 0.5, cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR), 0.5, 0)
     L = int(np.hypot(*img.shape[:2]))
@@ -833,9 +846,9 @@ def proc_houghline(img, st):
         x, y = a * rho, b * rho
         cv2.line(result, (int(x - L * b), int(y + L * a)), (int(x + L * b), int(y - L * a)),
                  (0, 0, 255), 2, cv2.LINE_AA)
-    acc, diag = hough_accumulator(edges)
-    draw_hough_space(result, acc, diag, lines, votes)
+    draw_hough_space(result, space, diag, lines, votes)
     put_info(result, "%d lines (votes >= %d)" % (len(lines), votes))
+    put_info(result, voting_label(st), row=1)
     return result
 
 
@@ -1061,7 +1074,7 @@ def print_help():
     print("                b ではしきい値を下げる・上げる（押すと手動になり値が固定される）")
     print("  ESC   : ぼかしと今の処理のパラメータを元に戻す（b はしきい値を自動（大津）に）")
     print("  i     : ヒストグラム表示の ON/OFF（g b e E）")
-    print("  w     : 円の Hough 変換の投票の広がりを切り替え（O。1 セル → σ=1 → 2 → 4 セルのぼかし投票）")
+    print("  w     : Hough 変換の投票の広がりを切り替え（H O。1 セル → σ=1 → 2 → 4 セルのぼかし投票）")
     print("  p     : 顔検出中に横顔検出の ON/OFF")
     print("  k     : 骨格推定中に平滑化の ON/OFF")
     print("  n     : NDI 送信の ON/OFF（ndi-python が必要・任意）")
@@ -1172,7 +1185,7 @@ def help_columns(st, ja):
                  ("", "を変える（, . でも可）", COLOR_ITEM),
                  ("ESC", "ぼかし・パラメータを元に戻す", COLOR_ITEM),
                  ("i", "ヒストグラム %s（g b e E）" % hist, COLOR_ITEM),
-                 ("w", "円の Hough のぼかし投票 %s（O）" % soft, COLOR_ITEM),
+                 ("w", "Hough のぼかし投票 %s（H O）" % soft, COLOR_ITEM),
                  ("p", "横顔検出 %s（F の実行中）" % profile, COLOR_ITEM),
                  ("k", "骨格の平滑化 %s（K の実行中）" % smooth, COLOR_ITEM),
                  ("n", "NDI 送信 ON/OFF（任意機能）", COLOR_ITEM),
@@ -1189,7 +1202,7 @@ def help_columns(st, ja):
                  ("", "(also , .)", COLOR_ITEM),
                  ("ESC", "reset blur & parameter", COLOR_ITEM),
                  ("i", "histogram %s (g b e E)" % hist, COLOR_ITEM),
-                 ("w", "circle Hough soft voting %s (O)" % soft, COLOR_ITEM),
+                 ("w", "Hough soft voting %s (H O)" % soft, COLOR_ITEM),
                  ("p", "profile face %s (during F)" % profile, COLOR_ITEM),
                  ("k", "pose smoothing %s (during K)" % smooth, COLOR_ITEM),
                  ("n", "NDI output ON/OFF (optional)", COLOR_ITEM),
