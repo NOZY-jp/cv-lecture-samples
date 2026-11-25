@@ -8,7 +8,10 @@ Webカメラから画像を1フレームずつ取り込み、キー操作で選�
     python capture.py            # カメラ番号 0 を使う
     python capture.py 1          # カメラ番号 1 を使う
     python capture.py movie.mp4  # カメラの代わりに動画ファイルを使う（繰り返し再生）
-    python capture.py --task 課題コード   # 課題の実行記録をとる（receipt.py を参照）
+    python capture.py --id 学籍番号        # 学籍番号を変える（初回は起動時に聞かれる）
+    python capture.py --no-record        # 演習記録をとらない
+
+実行中の操作は演習記録として receipts/record_学籍番号.txt に保存されます（receipt.py を参照）。
 
 キー操作は起動時にターミナルへ表示されます（README.md も参照）。
 
@@ -17,6 +20,7 @@ Webカメラから画像を1フレームずつ取り込み、キー操作で選�
 """
 
 import argparse
+import atexit
 import os
 import sys
 import time
@@ -72,7 +76,7 @@ class State:
         self.yunet = None         # YuNet（CNN による顔検出）
         self.pose = None          # MediaPipe Pose（人体の骨格推定）
         self.profile_face = True
-        self.found = None         # 検出系の処理が見つけた数（実行記録用。検出しない処理では None）
+        self.found = None         # 検出系の処理が見つけた数（演習記録用。検出しない処理では None）
 
         # Lucas-Kanade 追跡用
         self.lk_fnum = 1000
@@ -99,6 +103,8 @@ class State:
         self.show_hist = True
         self.hog = None           # HOG 特徴 + SVM の人物検出器
         self.hog_view = False     # P で画像全体の HOG 特徴を表示する（o キーで切り替え）
+        self.tried = None         # 演習記録で「試した」項目の集合（ヘルプで未体験の機能に印を付ける。記録しないときは None）
+        self.progress = {}        # 演習記録: パラメータごとの (試した値の数, 必要な数)
         self.hough_sigma = 0      # Hough 変換のぼかし投票の広がり σ（0 は 1 つのセルにだけ 1 票。w キーで切り替え）
 
         # 二値化のしきい値: None なら大津の方法で毎フレーム自動、数値なら ←/→ で決めた手動の値
@@ -790,7 +796,8 @@ def draw_key_guide(img, items, max_w, top=False):
         total = max_w
     lh = int(cv2.getTextSize("Ag", font, scale, 1)[0][1] * 1.8)
     bw, bh = int(total), lh * len(items) + 8
-    x0, y0 = 8, (8 if top else H - bh - 8)
+    # 上は FPS と記録の表示の 2 行、下は「?: ヘルプ」の表示の分を空ける
+    x0, y0 = 8, (int(H * 0.11) if top else H - bh - int(H * 0.06))
     roi = img[y0:y0 + bh, x0:x0 + bw]
     roi[:] = cv2.addWeighted(roi, 0.35, np.zeros_like(roi), 0.65, 0)
     for i, (k, d) in enumerate(items):
@@ -1226,6 +1233,54 @@ BLURS = {
 }
 
 
+# ----------------------------------------------------------------------
+# 演習記録の項目（receipt.py）: 試せる項目の一覧（カタログ）と、今のフレームで使っている項目
+#   proc:処理名 / param:処理名=値（←/→）/ set:処理名/設定=値（表示の切り替え）/ blur:種類（前処理）
+#   機能を追加したら、ここに項目を加えると網羅の割合に反映される（古い記録もそのまま読める）
+# ----------------------------------------------------------------------
+HIST_PROCS = ("gray", "binary", "hist_eq", "hist_eq_CLAHE")   # i でヒストグラムを表示できる処理
+
+
+def record_catalog():
+    items = ["proc:" + name for name, _, _ in PROCS.values()]
+    for proc, (_, values, _) in PARAMS.items():
+        items += ["param:%s=%s" % (proc, v) for v in values]
+    items += ["param:binary=otsu", "param:binary=manual"]
+    for proc in ("houghline", "houghcircle"):
+        items += ["set:%s/sigma=%d" % (proc, sg) for sg in HOUGH_SIGMAS]
+    for proc in HIST_PROCS:
+        items += ["set:%s/hist=on" % proc, "set:%s/hist=off" % proc]
+    items += ["set:pedestrian/hog=on", "set:pedestrian/hog=off",
+              "set:facedetect/profile=on", "set:facedetect/profile=off",
+              "set:pose/smoothing=on", "set:pose/smoothing=off"]
+    items += ["blur:" + name for name, _ in BLURS.values()]
+    return items
+
+
+def record_items(st):
+    """今のフレームで使っている項目（record_catalog の名前）"""
+    proc = st.proc
+    items = ["proc:" + proc]
+    if proc in PARAMS:
+        items.append("param:%s=%s" % (proc, param(st, proc)))
+    if proc == "binary":
+        items.append("param:binary=" + ("otsu" if st.bin_manual is None else "manual"))
+    if proc in ("houghline", "houghcircle"):
+        items.append("set:%s/sigma=%d" % (proc, st.hough_sigma))
+    if proc in HIST_PROCS:
+        items.append("set:%s/hist=%s" % (proc, "on" if st.show_hist else "off"))
+    if proc == "pedestrian":
+        items.append("set:pedestrian/hog=" + ("on" if st.hog_view else "off"))
+    if proc == "facedetect":
+        items.append("set:facedetect/profile=" + ("on" if st.profile_face else "off"))
+    if proc == "pose" and st.pose:
+        items.append("set:pose/smoothing=" + ("on" if st.pose.smoothing else "off"))
+    strength = {"gaussian": st.gaussian_scale, "median": st.median_scale, "bilateral": st.bilateral_scale}
+    if strength.get(st.blur_proc, 1) > 1:                # ぼかしが実際にかかっているとき
+        items.append("blur:" + st.blur_proc)
+    return items
+
+
 def print_help():
     print("-" * 60)
     print("キー操作（画像ウィンドウを選択した状態で押してください）")
@@ -1249,7 +1304,7 @@ def print_help():
     print("  p     : 顔検出中に横顔検出の ON/OFF")
     print("  k     : 骨格推定中に平滑化の ON/OFF")
     print("  n     : NDI 送信の ON/OFF（ndi-python が必要・任意）")
-    print("  R     : 実行記録を保存（--task で起動したとき）")
+    print("  R     : 演習記録をすぐ保存（自動でも保存）")
     print("  ?     : ヘルプ表示の ON/OFF（ウィンドウ）")
     print("  q     : 終了")
     print("-" * 60)
@@ -1285,6 +1340,7 @@ HELP_EN = {   # OpenCV 4 用の英語の説明（ない処理は処理名をそ�
 COLOR_HEAD = (255, 255, 0)      # 見出し（水色）
 COLOR_ITEM = (255, 255, 255)    # 通常（白）
 COLOR_CURRENT = (0, 255, 255)   # 選択中の処理（黄色）
+COLOR_UNTRIED = (0, 150, 255)   # まだ試していない機能（橙。演習記録をとっているとき）
 
 
 class TextDrawer:
@@ -1328,7 +1384,15 @@ def help_columns(st, ja):
         for k in keys:
             name, _, desc = PROCS[k]
             mark = (" ←→" if ja else " <->") if (name in PARAMS or name == "binary") else ""
-            rows.append((k, desc_of(name, desc) + mark, COLOR_CURRENT if name == st.proc else COLOR_ITEM))
+            prog = st.progress.get("param:" + name) if st.tried is not None else None
+            if prog:                                         # ←/→ の値のうち試した数 / 必要な数
+                mark += " %d/%d" % (min(prog[0], prog[1]), prog[1])
+            color = COLOR_ITEM
+            if name == st.proc:
+                color = COLOR_CURRENT
+            elif st.tried is not None and "proc:" + name not in st.tried:
+                color = COLOR_UNTRIED
+            rows.append((k, desc_of(name, desc) + mark, color))
         return rows
 
     blank = [("", "", COLOR_ITEM)]
@@ -1362,7 +1426,7 @@ def help_columns(st, ja):
                  ("p", "横顔検出 %s（F の実行中）" % profile, COLOR_ITEM),
                  ("k", "骨格の平滑化 %s（K の実行中）" % smooth, COLOR_ITEM),
                  ("n", "NDI 送信 ON/OFF（任意機能）", COLOR_ITEM),
-                 ("R", "実行記録を保存（--task で起動したとき）", COLOR_ITEM),
+                 ("R", "演習記録をすぐ保存（自動でも保存）", COLOR_ITEM),
                  ("?", "このヘルプを閉じる / 開く", COLOR_ITEM),
                  ("q", "終了", COLOR_ITEM)]
     else:
@@ -1380,9 +1444,13 @@ def help_columns(st, ja):
                  ("p", "profile face %s (during F)" % profile, COLOR_ITEM),
                  ("k", "pose smoothing %s (during K)" % smooth, COLOR_ITEM),
                  ("n", "NDI output ON/OFF (optional)", COLOR_ITEM),
-                 ("R", "save receipt (with --task)", COLOR_ITEM),
+                 ("R", "save the practice record now", COLOR_ITEM),
                  ("?", "close / open this help", COLOR_ITEM),
                  ("q", "quit", COLOR_ITEM)]
+    if st.tried is not None:
+        col3 += [("", "", COLOR_ITEM),
+                 ("", "橙: まだ試していない機能" if ja else "orange: not tried yet", COLOR_UNTRIED),
+                 ("", "（n/m: ←→ で試した値の数 / 目標）" if ja else "(n/m: values tried with <-> / goal)", COLOR_UNTRIED)]
     return [col1, col2, col3]
 
 
@@ -1442,7 +1510,7 @@ def draw_help(img, st, drawer, cache):
     H, W = img.shape[:2]
     key = (W, H, st.proc, st.blur_proc, st.gaussian_scale, st.median_scale,
            st.bilateral_scale, st.profile_face, bool(st.pose and st.pose.smoothing), st.show_hist,
-           st.hough_sigma, st.hog_view)
+           st.hough_sigma, st.hog_view, len(st.tried) if st.tried is not None else -1, sum(a for a, _ in st.progress.values()))
     if cache.get("key") != key:
         cache["key"] = key
         cache["layer"] = render_help_layer(W, H, st, drawer)
@@ -1533,58 +1601,61 @@ def open_source(arg):
     return cv2.VideoCapture(arg), True
 
 
-def draw_recording_status(img, recorder, drawer):
-    """実行記録をとっていることを画面の左下に表示する（--task で起動したとき）"""
+def draw_recording_status(img, recorder, drawer, cov):
+    """演習記録をとっていることと、網羅の状況（これまでの実行も含む）を FPS の表示の下に出す"""
     H, W = img.shape[:2]
-    px = status_px(H) * 0.75
-    used, switches, frames = recorder.summary()
+    px = status_px(H) * 0.7
+    procs = cov.get("proc", [0, 0])
+    others = [sum(cov.get(g, [0, 0])[i] for g in cov if g != "proc") for i in (0, 1)]
+    total = receipt_module().format_duration(recorder.total_seconds())
     if drawer.japanese:
-        lines = ["● 記録中  %s / %s（R: 保存）" % (recorder.task_code, recorder.student_id),
-                 "使った機能 %d   切り替え %d 回   %d フレーム" % (used, switches, frames)]
+        text = "● 記録中 %s   機能 %d/%d   設定 %d/%d   合計 %s   （? で未体験の機能を確認）" % (
+            recorder.student_id, procs[0], procs[1], others[0], others[1], total)
     else:
-        lines = ["REC  %s / %s (R: save)" % (recorder.task_code, recorder.student_id),
-                 "features %d   switches %d   frames %d" % (used, switches, frames)]
-    # 「?: ヘルプ」の表示の上に置き、背景を暗くして読みやすくする
-    line_h = px * 1.25
-    bottom = H - status_px(H) * 1.6
-    top = bottom - line_h * len(lines) - px * 0.4
-    width = max(drawer.width(t, px) for t in lines) + px * 1.2
-    y0, y1, x1 = max(int(top), 0), int(bottom), min(int(width), W)
-    img[y0:y1, :x1] = (img[y0:y1, :x1] * 0.35).astype(np.uint8)
-    y = top + px * 0.2
-    for i, text in enumerate(lines):
-        y += line_h
-        drawer.put(img, text, (px * 0.6, y - px * 0.25), (80, 80, 255) if i == 0 else (255, 255, 255),
-                   px, bold=(i == 0))
+        text = "REC %s   features %d/%d   settings %d/%d   total %s   (? to see untried)" % (
+            recorder.student_id, procs[0], procs[1], others[0], others[1], total)
+    y = status_px(H) * 1.3 + px * 1.5
+    width = min(int(drawer.width(text, px) + px * 1.2), W)
+    y0, y1 = int(y - px * 1.15), int(y + px * 0.45)
+    img[y0:y1, :width] = (img[y0:y1, :width] * 0.4).astype(np.uint8)
+    drawer.put(img, text, (px * 0.7, y), (120, 160, 255), px)
 
 
-def save_receipt(recorder):
+def receipt_module():
+    import receipt
+    return receipt
+
+
+def save_receipt(recorder, quiet=False):
     path, code = recorder.save()
+    if path is None or quiet:
+        return
+    R = receipt_module()
     print("-" * 60)
-    print("実行記録を保存しました: %s" % path)
+    print("演習記録を保存しました: %s" % path)
     print("確認コード: %s" % code)
-    used, switches, frames = recorder.summary()
-    print("使った機能 %d   切り替え %d 回   %d フレーム" % (used, switches, frames))
-    print("このファイルを提出してください。")
+    cov = recorder.coverage()
+    print("これまでに試した項目: " + "  ".join("%s %d/%d" % (R.GROUP_NAMES.get(g, g), a, b)
+                                         for g, (a, b) in R.sort_groups(cov)))
+    print("提出の指示があったら、このファイルを提出してください。")
     print("-" * 60)
 
 
 def main():
     parser = argparse.ArgumentParser(description="カメラキャプチャ＆画像処理サンプル")
     parser.add_argument("source", nargs="?", default=None, help="カメラ番号 または 動画ファイル (default: 0)")
-    parser.add_argument("--task", default=None, help="課題コード（指定すると実行記録をとる）")
-    parser.add_argument("--id", default=None, help="学籍番号（--task のとき。省略すると入力を求める）")
+    parser.add_argument("--id", default=None, help="学籍番号（初回に入力したものを変えるとき）")
+    parser.add_argument("--task", default="", help="課題コード（指示があったとき。演習記録に付ける）")
+    parser.add_argument("--no-record", action="store_true", help="演習記録をとらない")
     args = parser.parse_args()
 
-    # 実行記録用のインストール ID（初回の実行時に作られる）
-    import receipt
-    try:
-        receipt.ensure_install_id()
-    except Exception:
-        pass
+    # 演習記録（receipt.py）: 学籍番号は初回だけ聞き、このフォルダに保存しておく
+    R = receipt_module()
     recorder = None
-    if args.task:
-        student_id = receipt.normalize(args.id) if args.id else receipt.ask_student_id()
+    student_id = None
+    if not args.no_record:
+        R.ensure_install_id()
+        student_id = R.get_student_id(args.id)
 
     cap, is_file = open_source(args.source)
 
@@ -1609,10 +1680,17 @@ def main():
     show_help = SHOW_HELP_AT_START
     drawer = TextDrawer()
     help_cache = {}
-    if args.task:
-        recorder = receipt.Recorder(args.task, student_id, "file" if is_file else "camera", (width, height))
-        print("課題コード %s / 学籍番号 %s で実行記録をとります。" % (recorder.task_code, recorder.student_id))
-        print("いろいろな機能を試してください。終了（q）または R キーで記録を保存します。")
+    if student_id:
+        recorder = R.Recorder("capture", student_id, record_catalog(), args.task,
+                              "file" if is_file else "camera", (width, height))
+        print("学籍番号 %s で演習記録をとります（%s）。違う場合は --id で指定してください。"
+              % (student_id, os.path.relpath(R.record_path(student_id))))
+        if recorder.load_state == "broken":
+            print("前の記録ファイルが壊れていたので、別の名前で残して新しく記録します。")
+        st.tried, st.progress = recorder.tried(), recorder.progress()
+        atexit.register(recorder.save)          # Ctrl+C などで止めたときも保存する
+    coverage = recorder.coverage() if recorder else {}
+    t_tried = time.perf_counter()
 
     t_prev = time.perf_counter()
     while True:
@@ -1632,7 +1710,7 @@ def main():
         # 処理速度のため縮小
         img = cv2.resize(img, proc_size)
 
-        # キー入力（実行記録をとっているときは、どの処理の実行中に押したかを記録）
+        # キー入力（演習記録をとっているときは、どの処理の実行中に押したかを記録）
         key = read_key()
         if recorder is not None:
             recorder.on_key(key, st.proc)
@@ -1702,7 +1780,12 @@ def main():
         st.found = None
         result = PROC_FUNCS[st.proc](img, st)
         if recorder is not None:
-            recorder.record(st.proc, raw, st, param(st, st.proc) if st.proc in PARAMS else None)
+            recorder.record(st.proc, raw, st, param(st, st.proc) if st.proc in PARAMS else None,
+                            items=record_items(st))
+            if t_now - t_tried >= 1.0:          # 網羅の状況は 1 秒ごとに計算し直す
+                t_tried = t_now
+                st.tried, st.progress = recorder.tried(), recorder.progress()
+                coverage = recorder.coverage()
 
         # 表示
         if result.ndim == 2:
@@ -1720,7 +1803,7 @@ def main():
             drawer.put(result, "?: ヘルプ" if drawer.japanese else "?: help",
                        (px * 0.5, height - px * 0.6), (0, 255, 0), px * 0.8)
             if recorder is not None:
-                draw_recording_status(result, recorder, drawer)
+                draw_recording_status(result, recorder, drawer, coverage)
         cv2.imshow(WINDOW_NAME, result)
 
         # NDI へ送信

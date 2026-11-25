@@ -160,7 +160,7 @@ if has_mp:
     result(all(os.path.exists(f) for f in tasks), "MediaPipe のモデル (models/*.task)",
            "python download_models.py でダウンロードしてください", required=False)
 
-print("--- 実行記録（課題の提出用）---")
+print("--- 演習記録（提出用）---")
 try:
     sys.path.insert(0, HERE)
     import receipt

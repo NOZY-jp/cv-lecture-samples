@@ -12,6 +12,6 @@ models/pose_estimation_mediapipe_2023mar.onnx
 models/*.task
 models/*.part
 
-# 実行記録（課題の提出用）
+# 演習記録（提出用。学籍番号と記録は各自のもの）
 .install_id
 receipts/
