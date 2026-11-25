@@ -98,7 +98,7 @@ class State:
         self.param_index = {}
         self.show_hist = True
         self.hog = None           # HOG 特徴 + SVM の人物検出器
-        self.hough_soft = False   # Hough 変換の投票: False = 1 つのセルに 1 票、True = ぼかし投票（w キー）
+        self.hough_sigma = 0      # Hough 変換のぼかし投票の広がり σ（0 は 1 つのセルにだけ 1 票。w キーで切り替え）
 
         # 二値化のしきい値: None なら大津の方法で毎フレーム自動、数値なら ←/→ で決めた手動の値
         self.bin_manual = None
@@ -611,22 +611,40 @@ PARAMS = {
     "quantize":    ("bits", [8, 7, 6, 5, 4, 3, 2, 1], 3),
     "sampling":    ("block", [1, 2, 3, 4, 6, 8, 12, 16, 24, 32], 8),
     "labeling2":   ("min area", [10, 25, 50, 100, 200, 400, 800, 1600, 3200], 100),
-    "houghline":   ("votes", [40, 60, 80, 100, 120, 150, 200, 250, 300, 400, 500, 700, 1000], 200),
-    "houghcircle": ("votes", [20, 30, 40, 50, 60, 80, 100, 120, 150, 200, 300, 400, 600], 100),
+    "houghline":   ("votes", [40, 60, 80, 100, 120, 150, 200, 250, 300, 400, 500, 700, 1000, 1500, 2000,
+                              3000, 4000, 6000, 8000, 12000, 16000, 24000], 200),
+    "houghcircle": ("votes", [20, 30, 40, 50, 60, 80, 100, 120, 150, 200, 300, 400, 600, 800, 1200, 1600,
+                              2400, 3200, 4800, 6400, 9600, 12800, 19200], 100),
     "pedestrian":  ("SVM threshold", [-0.5, 0.0, 0.25, 0.5, 0.75, 1.0, 1.5], 0.0),
 }
 
 
+def param_key(st, proc):
+    """パラメータを覚えておく名前。Hough 変換のしきい値は、ぼかし投票の σ ごとに別々に覚える"""
+    if proc in HOUGH_SIGMA_GAIN and st.hough_sigma:
+        return "%s@sigma%d" % (proc, st.hough_sigma)
+    return proc
+
+
+def param_default_index(st, proc):
+    """パラメータの最初の値の位置（Hough 変換のぼかし投票では、最初の値に σ ごとの倍率を掛けた値に近いもの）"""
+    _, values, default = PARAMS[proc]
+    if proc in HOUGH_SIGMA_GAIN and st.hough_sigma:
+        target = default * HOUGH_SIGMA_GAIN[proc][st.hough_sigma]
+        return int(np.argmin([abs(np.log(v / target)) for v in values]))
+    return values.index(default)
+
+
 def param(st, proc):
     """処理 proc の、いまのパラメータの値"""
-    _, values, default = PARAMS[proc]
-    return values[st.param_index.get(proc, values.index(default))]
+    _, values, _ = PARAMS[proc]
+    return values[st.param_index.get(param_key(st, proc), param_default_index(st, proc))]
 
 
 def shift_param(st, proc, step):
-    _, values, default = PARAMS[proc]
-    i = st.param_index.get(proc, values.index(default))
-    st.param_index[proc] = int(np.clip(i + step, 0, len(values) - 1))
+    _, values, _ = PARAMS[proc]
+    i = st.param_index.get(param_key(st, proc), param_default_index(st, proc))
+    st.param_index[param_key(st, proc)] = int(np.clip(i + step, 0, len(values) - 1))
 
 
 def put_outlined(img, text, org, scale, color, thickness=1):
@@ -698,40 +716,56 @@ def proc_sampling(img, st):
 
 
 MAX_HOUGH_LINES = 40
-HOUGH_SOFT_SIGMA = 0.7        # ぼかし投票で、周りのセルに票を広げる範囲（セル単位の標準偏差）
-HOUGH_LINE_NMS = 10           # 直線の検出で、同じ山とみなす距離（セル。ρ 1 画素・θ 1° が 1 セル）
+HOUGH_SIGMAS = [0, 1, 2, 4]   # ぼかし投票の広がり σ [セル]（w キーで順に切り替え。0 は 1 セル投票）
+# ぼかし投票では周りの票も加わって山の票数が大きくなるので、σ ごとのしきい値の最初の値は、
+# 1 セル投票の最初の値にこの倍率を掛けたものにする（サンプル画像で、本物の直線・円が同程度に検出される比を測った目安）。
+# しきい値は σ ごとに別々に覚えるので、←/→ で調整した値は σ を切り替えても残る
+HOUGH_SIGMA_GAIN = {"houghline": {0: 1, 1: 3, 2: 10, 4: 33}, "houghcircle": {0: 1, 1: 5, 2: 15, 4: 40}}
 
 
-def soft_votes(acc):
-    """ぼかし投票: 1 票を、計算結果のセルを中心に、周りのセルにも距離に応じて少しずつ分けて入れる
-    （重みはガウス関数、合計 1 票）。1 つのセルに 1 票ずつ入れた投票空間をガウス関数でぼかすのと同じ結果になる。
-    合計が 1 票なので、票数の大きさは 1 セルに投票した場合とほぼ同じで、同じしきい値で比べられる"""
-    k = cv2.getGaussianKernel(5, HOUGH_SOFT_SIGMA).astype(np.float32)     # 合計 1 に正規化済み
-    return cv2.sepFilter2D(acc.astype(np.float32), -1, k, k, borderType=cv2.BORDER_CONSTANT)
+def soft_votes(acc, sigma, wrap=False):
+    """ぼかし投票: 各票を、計算結果のセルに 1 票、そこから距離 d のセルに exp(-d²/2σ²) 票と、
+    周りにも少ない票を入れる。1 つのセルに投票した表を、中心の重みが 1 のガウス関数でぼかすのと同じ結果。
+    wrap=True（直線）では θ の両端をつなぐ（θ = 0° と 180° は、ρ の符号を反転すると同じ直線）"""
+    if sigma == 0:
+        return acc.astype(np.float32)
+    n = int(6 * sigma) | 1
+    k = cv2.getGaussianKernel(n, sigma)
+    k = (k / k.max()).astype(np.float32)               # 計算結果のセル（中心）の重みを 1 にする
+    a = acc.astype(np.float32)
+    if wrap:
+        p = n // 2
+        a = np.hstack([a[::-1, -p:], a, a[::-1, :p]])
+        return cv2.sepFilter2D(a, -1, k, k, borderType=cv2.BORDER_CONSTANT)[:, p:-p]
+    return cv2.sepFilter2D(a, -1, k, k, borderType=cv2.BORDER_CONSTANT)
 
 
-def find_peaks(acc, threshold, min_dist, max_n):
+def find_peaks(acc, threshold, win_r, win_c, max_n, wrap=False):
     """投票空間から山を選ぶ（直線・円で共通）:
-    1. 周り 3x3 のセルの中で票数が最大のセルだけを残す（非極大値の抑制）
-    2. 票数がしきい値以上のものを、票の多い順に選ぶ
-    3. すでに選んだ山から min_dist セル以内のものは、同じ山の一部とみなして除く
+    1. 非極大値の抑制: 縦 ±win_r・横 ±win_c セルの範囲で票数が最大のセルだけを残す
+       （wrap=True のときは θ の両端をつないで判定する）
+    2. 票数がしきい値以上のものを、票の多い順に最大 max_n 個選ぶ
     戻り値: [(行, 列, 票数), ...]"""
-    acc = acc.astype(np.float32)
-    local_max = acc >= cv2.dilate(acc, np.ones((3, 3), np.uint8))
+    a = acc.astype(np.float32)
+    a = a + np.arange(a.size, dtype=np.float32).reshape(a.shape) * 1e-7   # 同じ票数のセルが並ぶときの順位付け
+    ext = np.hstack([a[::-1, -win_c:], a, a[::-1, :win_c]]) if wrap else a
+    local_max = ext >= cv2.dilate(ext, np.ones((2 * win_r + 1, 2 * win_c + 1), np.uint8))
+    if wrap:
+        local_max = local_max[:, win_c:-win_c]
     rows, cols = np.nonzero(local_max & (acc >= threshold))
-    order = np.argsort(-acc[rows, cols])[:3000]          # 候補が多すぎるときは票の多いものから
-    peaks = []
-    for i in order:
-        r, c = int(rows[i]), int(cols[i])
-        if all((r - pr) ** 2 + (c - pc) ** 2 > min_dist ** 2 for pr, pc, _ in peaks):
-            peaks.append((r, c, float(acc[r, c])))
-            if len(peaks) >= max_n:
-                break
-    return peaks
+    order = np.argsort(-acc[rows, cols])[:max_n]
+    return [(int(rows[i]), int(cols[i]), float(acc[rows[i], cols[i]])) for i in order]
+
+
+def set_hough_sigma(st, sigma):
+    """ぼかし投票の σ を切り替える（しきい値は σ ごとに覚えている値になる）"""
+    st.hough_sigma = sigma
 
 
 def voting_label(st):
-    return "voting: soft (w: single cell)" if st.hough_soft else "voting: single cell (w: soft)"
+    if st.hough_sigma == 0:
+        return "voting: single cell (w: blur)"
+    return "voting: blurred sigma=%d (w: next)" % st.hough_sigma
 
 
 def hough_accumulator(edges, max_points=30000):
@@ -790,8 +824,10 @@ def proc_houghline(img, st):
     edges = cv2.Canny(gray, 50, 150)
     votes = param(st, "houghline")
     acc, diag = hough_accumulator(edges)
-    space = soft_votes(acc) if st.hough_soft else acc
-    peaks = find_peaks(space, votes, min_dist=HOUGH_LINE_NMS, max_n=MAX_HOUGH_LINES)
+    sg = st.hough_sigma
+    space = soft_votes(acc, sg, wrap=True)
+    # 非極大値の抑制の範囲: ρ ±max(15, 3σ) 画素、θ ±max(5, 3σ) 度
+    peaks = find_peaks(space, votes, max(15, 3 * sg), max(5, 3 * sg), MAX_HOUGH_LINES, wrap=True)
     lines = [(r - diag, np.deg2rad(c)) for r, c, _ in peaks]          # 行 → ρ、列 → θ（度）
     st.found = len(lines)
     result = cv2.addWeighted(img, 0.5, cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR), 0.5, 0)
@@ -900,8 +936,10 @@ def proc_houghcircle(img, st):
     votes = param(st, "houghcircle")
     min_r, max_r = max(H // 40, 5), H // 3
     acc, edges = hough_circle_centers(gray, min_r, max_r)
-    space = soft_votes(acc) if st.hough_soft else acc
-    peaks = find_peaks(space, votes, min_dist=H / 12 / HOUGH_CIRCLE_DP, max_n=50)
+    space = soft_votes(acc, st.hough_sigma)
+    # 非極大値の抑制の範囲: 中心どうしの最小距離（画像の高さの 1/12）と 3σ の大きい方
+    win = max(int(H / 12 / HOUGH_CIRCLE_DP), 3 * st.hough_sigma)
+    peaks = find_peaks(space, votes, win, win, max_n=50)
     ys, xs = np.nonzero(edges)
     circles = []
     for r, c, _ in peaks:
@@ -1027,7 +1065,7 @@ def print_help():
     print("                b ではしきい値を下げる・上げる（押すと手動になり値が固定される）")
     print("  ESC   : ぼかしと今の処理のパラメータを元に戻す（b はしきい値を自動（大津）に）")
     print("  i     : ヒストグラム表示の ON/OFF（g b e E）")
-    print("  w     : Hough 変換のぼかし投票の ON/OFF（H O。OFF は 1 つのセルにだけ 1 票）")
+    print("  w     : Hough 変換の投票の広がりを切り替え（H O。1 セル → σ=1 → 2 → 4 セルのぼかし投票）")
     print("  p     : 顔検出中に横顔検出の ON/OFF")
     print("  k     : 骨格推定中に平滑化の ON/OFF")
     print("  n     : NDI 送信の ON/OFF（ndi-python が必要・任意）")
@@ -1127,7 +1165,7 @@ def help_columns(st, ja):
     profile = "ON" if st.profile_face else "OFF"
     smooth = "OFF" if (st.pose and not st.pose.smoothing) else "ON"
     hist = "ON" if st.show_hist else "OFF"
-    soft = "ON" if st.hough_soft else "OFF"
+    soft = ("σ=%d" if ja else "sigma=%d") % st.hough_sigma if st.hough_sigma else "OFF"
     if ja:
         col3 += [("↑ / +", "ぼかしを強く", COLOR_ITEM),
                  ("↓ / -", "ぼかしを弱く", COLOR_ITEM),
@@ -1221,7 +1259,7 @@ def draw_help(img, st, drawer, cache):
     H, W = img.shape[:2]
     key = (W, H, st.proc, st.blur_proc, st.gaussian_scale, st.median_scale,
            st.bilateral_scale, st.profile_face, bool(st.pose and st.pose.smoothing), st.show_hist,
-           st.hough_soft)
+           st.hough_sigma)
     if cache.get("key") != key:
         cache["key"] = key
         cache["layer"] = render_help_layer(W, H, st, drawer)
@@ -1430,11 +1468,13 @@ def main():
         elif key == chr(27):          # ESC: ぼかしと今の処理のパラメータを元に戻す
             st.reset_param()
             st.bin_manual = None
-            st.param_index.pop(st.proc, None)
+            st.param_index.pop(param_key(st, st.proc), None)
         elif key == 'i':
             st.show_hist = not st.show_hist
         elif key == 'w':
-            st.hough_soft = not st.hough_soft
+            # ぼかし投票の広がりを 0（1 セル投票）→ 1 → 2 → 4 → 0 … と切り替える
+            i = HOUGH_SIGMAS.index(st.hough_sigma)
+            set_hough_sigma(st, HOUGH_SIGMAS[(i + 1) % len(HOUGH_SIGMAS)])
         elif key == '?':
             show_help = not show_help
             if show_help:
