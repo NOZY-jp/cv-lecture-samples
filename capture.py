@@ -764,8 +764,38 @@ def set_hough_sigma(st, sigma):
 
 def voting_label(st):
     if st.hough_sigma == 0:
-        return "voting: single cell (w: blur)"
-    return "voting: blurred sigma=%d (w: next)" % st.hough_sigma
+        return "voting: single cell"
+    return "voting: blurred sigma=%d" % st.hough_sigma
+
+
+HOUGH_KEYS = [("<- ->", "vote threshold"),
+              ("w", "voting: single cell / blur sigma 1, 2, 4"),
+              ("ESC", "reset threshold"),
+              ("?", "all keys")]
+
+
+def draw_key_guide(img, items, max_w):
+    """画像の左下に、この処理で使えるキーの一覧を半透明の黒い枠の中に描く（常に表示）。
+    items: [(キー, 説明), ...]、max_w: 枠の幅の上限（右下のヒートマップに重ならないように）"""
+    H = img.shape[0]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(H / 900.0, 0.35)
+    width = lambda t, sc: cv2.getTextSize(t, font, sc, 1)[0][0]
+    key_w = max(width(k, scale) for k, _ in items)
+    total = key_w + 12 + max(width(d, scale) for _, d in items) + 16
+    if total > max_w:                                  # 入りきらなければ文字を小さくする
+        scale *= max_w / total
+        key_w = max(width(k, scale) for k, _ in items)
+        total = max_w
+    lh = int(cv2.getTextSize("Ag", font, scale, 1)[0][1] * 1.8)
+    bw, bh = int(total), lh * len(items) + 8
+    x0, y0 = 8, H - bh - 8
+    roi = img[y0:y0 + bh, x0:x0 + bw]
+    roi[:] = cv2.addWeighted(roi, 0.35, np.zeros_like(roi), 0.65, 0)
+    for i, (k, d) in enumerate(items):
+        y = y0 + 4 + lh * (i + 1) - lh // 4
+        put_outlined(img, k, (x0 + 8, y), scale, (0, 255, 255))
+        put_outlined(img, d, (x0 + 8 + key_w + 12, y), scale, (255, 255, 255))
 
 
 def hough_accumulator(edges, max_points=15000):
@@ -847,6 +877,7 @@ def proc_houghline(img, st):
         cv2.line(result, (int(x - L * b), int(y + L * a)), (int(x + L * b), int(y - L * a)),
                  (0, 0, 255), 2, cv2.LINE_AA)
     draw_hough_space(result, space, diag, lines, votes)
+    draw_key_guide(result, HOUGH_KEYS, int(result.shape[1] * 0.58) - 24)
     put_info(result, "%d lines (votes >= %d)" % (len(lines), votes))
     put_info(result, voting_label(st), row=1)
     return result
@@ -962,6 +993,7 @@ def proc_houghcircle(img, st):
         cv2.circle(result, (x, y), r, (0, 255, 0), 2, cv2.LINE_AA)
         cv2.drawMarker(result, (x, y), (0, 0, 255), cv2.MARKER_CROSS, 8, 2)
     draw_circle_space(result, space, [(x, y) for x, y, _ in circles], votes)
+    draw_key_guide(result, HOUGH_KEYS, int(result.shape[1] * 0.64) - 24)
     put_info(result, "%d circles (votes >= %d)" % (len(circles), votes))
     put_info(result, voting_label(st), row=1)
     return result
