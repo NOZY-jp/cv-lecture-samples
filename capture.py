@@ -98,6 +98,7 @@ class State:
         self.param_index = {}
         self.show_hist = True
         self.hog = None           # HOG 特徴 + SVM の人物検出器
+        self.hog_view = False     # P で画像全体の HOG 特徴を表示する（o キーで切り替え）
         self.hough_sigma = 0      # Hough 変換のぼかし投票の広がり σ（0 は 1 つのセルにだけ 1 票。w キーで切り替え）
 
         # 二値化のしきい値: None なら大津の方法で毎フレーム自動、数値なら ←/→ で決めた手動の値
@@ -1011,10 +1012,112 @@ def load_hog(st):
     return st.hog is not False
 
 
+HOG_CELL = 8      # HOG のセルの大きさ [画素]（OpenCV の人物検出器と同じ）
+HOG_BINS = 9      # 勾配の向きの数（0〜180° を 20° ずつ。b 番目は (b + 0.5) × 20° が中心）
+PEDESTRIAN_KEYS = [("<- ->", "SVM threshold"),
+                   ("o", "show HOG of the whole image"),
+                   ("ESC", "reset threshold"),
+                   ("?", "all keys")]
+
+
+def hog_glyphs(size):
+    """HOG の向きごとの絵（size x size 画素）。b 番目の向きの勾配は、それに垂直なエッジの向きの線分で表す"""
+    glyphs = np.zeros((HOG_BINS, size, size), np.float32)
+    c = (size - 1) / 2.0
+    for b in range(HOG_BINS):
+        a = np.deg2rad((b + 0.5) * 180.0 / HOG_BINS)          # 勾配の向き（画像の座標で、y は下向き）
+        dx, dy = -np.sin(a) * size / 2, np.cos(a) * size / 2   # エッジの向き（勾配に垂直）
+        p1 = (int(round((c - dx) * 16)), int(round((c - dy) * 16)))
+        p2 = (int(round((c + dx) * 16)), int(round((c + dy) * 16)))
+        cv2.line(glyphs[b], p1, p2, 1.0, max(size // 8, 1), cv2.LINE_AA, shift=4)
+    return glyphs
+
+
+def hog_cells(desc, ncx, ncy):
+    """HOGDescriptor.compute の結果を、セルごとの向きのヒストグラム [セルの行, 列, 向き] に戻す。
+    特徴は 2x2 セルのブロックごとに正規化して並べてあり（ブロックもブロック内のセルも列の順）、
+    1 つのセルは最大 4 つのブロックに含まれるので、それらの平均をとる"""
+    nbx, nby = ncx - 1, ncy - 1
+    d = np.asarray(desc, np.float32).reshape(nbx, nby, 2, 2, HOG_BINS)   # [ブロック x, y, セル x, y, 向き]
+    cells = np.zeros((ncy, ncx, HOG_BINS), np.float32)
+    count = np.zeros((ncy, ncx, 1), np.float32)
+    for i in (0, 1):
+        for j in (0, 1):
+            cells[j:j + nby, i:i + nbx] += d[:, :, i, j].transpose(1, 0, 2)
+            count[j:j + nby, i:i + nbx] += 1
+    return cells / count
+
+
+def render_hog(cells, size, scale=None):
+    """セルごとの向きのヒストグラムを、セルごとに 9 本の線分（明るさが大きさ）の絵にする。
+    scale: 明るさ 1 にする値（None なら全体の上位 0.5% の値）。戻り値: 0〜1 のグレースケール画像"""
+    v = np.maximum(cells, 0)
+    if scale is None:
+        scale = np.percentile(v, 99.5)
+    v = v / max(scale, 1e-6)
+    ny, nx = cells.shape[:2]
+    out = np.einsum("yxb,bij->yixj", v, hog_glyphs(size)).reshape(ny * size, nx * size)
+    return np.clip(out, 0, 1)
+
+
+def hog_of_image(img):
+    """画像全体の、8x8 画素のセルごとの勾配の向きのヒストグラム（HOG のブロック正規化の前の段階）。
+    各画素の勾配の大きさを、向きの近い 2 つの向き（20° 刻み）に比例配分して足し合わせる。
+    （正規化の後の特徴は、平らな所の小さな勾配まで大きくなって全体が一様に見えるので、画像全体はこちらで表示する）"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=1)       # [-1, 0, 1] の差分（HOG と同じ）
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=1)
+    mag, ang = cv2.cartToPolar(gx, gy, angleInDegrees=True)
+    pos = (ang % 180.0) / (180.0 / HOG_BINS) - 0.5         # b 番目の向きの中心が pos = b
+    b0 = np.floor(pos)
+    frac = pos - b0
+    b0 = b0.astype(int) % HOG_BINS
+    ncx, ncy = img.shape[1] // HOG_CELL, img.shape[0] // HOG_CELL
+    mag, frac, b0 = [m[:ncy * HOG_CELL, :ncx * HOG_CELL] for m in (mag, frac, b0)]
+    cells = np.zeros((ncy, ncx, HOG_BINS), np.float32)
+    for b in range(HOG_BINS):
+        w = mag * ((b0 == b) * (1 - frac) + (b0 == (b - 1) % HOG_BINS) * frac)
+        cells[..., b] = cv2.resize(w, (ncx, ncy), interpolation=cv2.INTER_AREA)
+    return cells
+
+
+def draw_person_hog(result, small, rect, s, st):
+    """検出した人物の窓について、画面の右下に 3 つの図を並べる:
+    窓の画像（64x128 に縮めたもの）、その HOG 特徴、SVM の重み（正の部分）。
+    窓の HOG 特徴と SVM の重みの内積 + バイアスが、人物らしさの値（score）になる"""
+    x, y, w, h = rect
+    win = st.hog.winSize                                   # (64, 128)
+    crop = cv2.resize(small[max(y, 0):y + h, max(x, 0):x + w], win, interpolation=cv2.INTER_AREA)
+    feat = st.hog.compute(crop).ravel()
+    svm = np.asarray(st.hog.getSVMDetector() if hasattr(st.hog, "getSVMDetector")
+                     else st.hog.svmDetector, np.float32).ravel()
+    score = float(feat @ svm[:-1] + svm[-1])
+    ncx, ncy = win[0] // HOG_CELL, win[1] // HOG_CELL
+    H, W = result.shape[:2]
+    size = max(int(H * 0.5) // ncy, 4)                     # 図のセルの大きさ（画素）
+    tw, th = ncx * size, ncy * size
+    tiles = [(cv2.resize(crop, (tw, th), interpolation=cv2.INTER_LINEAR), "window"),
+             (render_hog(hog_cells(feat, ncx, ncy), size), "HOG"),
+             (render_hog(hog_cells(svm[:-1], ncx, ncy), size), "SVM w > 0")]
+    gap = 6
+    x0 = W - 3 * tw - 2 * gap - 8
+    y0 = H - th - 8
+    fscale = max(H / 900.0, 0.3)
+    for k, (tile, name) in enumerate(tiles):
+        if tile.dtype != np.uint8:
+            tile = cv2.cvtColor((tile * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        tx = x0 + k * (tw + gap)
+        result[y0:y0 + th, tx:tx + tw] = tile
+        cv2.rectangle(result, (tx, y0), (tx + tw, y0 + th), (255, 255, 255), 1)
+        put_outlined(result, name, (tx + 3, y0 + th - 5), fscale, (0, 255, 255))
+    put_outlined(result, "score = HOG . w + b = %.2f" % score, (x0, y0 - 8), fscale, (0, 255, 255))
+
+
 def proc_pedestrian(img, st):
     # HOG 特徴 + 線形 SVM による人物（歩行者）検出。64x128 画素の窓を動かしながら、
     # 窓内の HOG 特徴を SVM で「人／人でない」に分類する（全身が映っている必要がある）
-    # ←/→ で SVM の判定のしきい値（大きいほど厳しい）
+    # ←/→ で SVM の判定のしきい値（大きいほど厳しい）、o で画像全体の HOG 特徴の表示
+    # 人物を検出したら、いちばん人物らしい窓の画像・HOG 特徴・SVM の重みを右下に表示する
     if not load_hog(st):
         return show_unavailable(img, "HOG + SVM not available")
     s = min(1.0, 640.0 / img.shape[1])                  # 速さのため幅 640 画素以下にして検出
@@ -1022,13 +1125,29 @@ def proc_pedestrian(img, st):
     thr = param(st, "pedestrian")
     rects, weights = st.hog.detectMultiScale(small, hitThreshold=thr, winStride=(8, 8),
                                              padding=(8, 8), scale=1.05)
+    weights = np.ravel(weights) if len(rects) else []
     st.found = len(rects)
-    result = img.copy()
-    for (x, y, w, h), wt in zip(rects, np.ravel(weights) if len(rects) else []):
+    if st.hog_view:
+        # 画像全体の HOG: 8x8 画素のセルごとに、勾配の向きのヒストグラムを線分の明るさで表す
+        g = render_hog(hog_of_image(small), HOG_CELL)
+        g = cv2.resize(g, (int(g.shape[1] / s), int(g.shape[0] / s)), interpolation=cv2.INTER_LINEAR)
+        result = (img * 0.25).astype(np.uint8)
+        hy, hx = min(g.shape[0], img.shape[0]), min(g.shape[1], img.shape[1])
+        result[:hy, :hx] = np.maximum(result[:hy, :hx], (g[:hy, :hx, None] * 255).astype(np.uint8))
+    else:
+        result = img.copy()
+    for (x, y, w, h), wt in zip(rects, weights):
         x, y, w, h = [int(v / s) for v in (x, y, w, h)]
         cv2.rectangle(result, (x, y), (x + w, y + h), (0, 255, 0), 2)
         cv2.putText(result, "%.2f" % wt, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    if len(rects):
+        best = int(np.argmax(weights))
+        draw_person_hog(result, small, rects[best], s, st)
+        bx, by, bw, bh = [int(v / s) for v in rects[best]]
+        cv2.rectangle(result, (bx, by), (bx + bw, by + bh), (0, 255, 255), 2)
     put_info(result, "%d persons (SVM threshold %.2f)" % (len(rects), thr))
+    put_info(result, "HOG view (o: off)" if st.hog_view else "o: HOG view", row=1)
+    draw_key_guide(result, PEDESTRIAN_KEYS, int(result.shape[1] * 0.45))
     return result
 
 
@@ -1206,6 +1325,7 @@ def help_columns(st, ja):
     profile = "ON" if st.profile_face else "OFF"
     smooth = "OFF" if (st.pose and not st.pose.smoothing) else "ON"
     hist = "ON" if st.show_hist else "OFF"
+    hogv = "ON" if st.hog_view else "OFF"
     soft = ("σ=%d" if ja else "sigma=%d") % st.hough_sigma if st.hough_sigma else "OFF"
     if ja:
         col3 += [("↑ / +", "ぼかしを強く", COLOR_ITEM),
@@ -1218,6 +1338,7 @@ def help_columns(st, ja):
                  ("ESC", "ぼかし・パラメータを元に戻す", COLOR_ITEM),
                  ("i", "ヒストグラム %s（g b e E）" % hist, COLOR_ITEM),
                  ("w", "Hough のぼかし投票 %s（H O）" % soft, COLOR_ITEM),
+                 ("o", "HOG 特徴の表示 %s（P の実行中）" % hogv, COLOR_ITEM),
                  ("p", "横顔検出 %s（F の実行中）" % profile, COLOR_ITEM),
                  ("k", "骨格の平滑化 %s（K の実行中）" % smooth, COLOR_ITEM),
                  ("n", "NDI 送信 ON/OFF（任意機能）", COLOR_ITEM),
@@ -1235,6 +1356,7 @@ def help_columns(st, ja):
                  ("ESC", "reset blur & parameter", COLOR_ITEM),
                  ("i", "histogram %s (g b e E)" % hist, COLOR_ITEM),
                  ("w", "Hough soft voting %s (H O)" % soft, COLOR_ITEM),
+                 ("o", "HOG view %s (during P)" % hogv, COLOR_ITEM),
                  ("p", "profile face %s (during F)" % profile, COLOR_ITEM),
                  ("k", "pose smoothing %s (during K)" % smooth, COLOR_ITEM),
                  ("n", "NDI output ON/OFF (optional)", COLOR_ITEM),
@@ -1300,7 +1422,7 @@ def draw_help(img, st, drawer, cache):
     H, W = img.shape[:2]
     key = (W, H, st.proc, st.blur_proc, st.gaussian_scale, st.median_scale,
            st.bilateral_scale, st.profile_face, bool(st.pose and st.pose.smoothing), st.show_hist,
-           st.hough_sigma)
+           st.hough_sigma, st.hog_view)
     if cache.get("key") != key:
         cache["key"] = key
         cache["layer"] = render_help_layer(W, H, st, drawer)
@@ -1539,6 +1661,9 @@ def main():
             st.pose.smoothing = not st.pose.smoothing
             st.pose.reset()
             print("pose smoothing:", "ON" if st.pose.smoothing else "OFF")
+        elif key == 'o' and st.proc == "pedestrian":
+            st.hog_view = not st.hog_view
+            print("HOG view:", "ON" if st.hog_view else "OFF")
         elif key == 'p' and st.proc == "facedetect":
             st.profile_face = not st.profile_face
             print("profile face mode" if st.profile_face else "frontal face mode")
